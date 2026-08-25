@@ -1,0 +1,30 @@
+{
+  "C_Cpp.errorSquiggles": "disabled",
+  "idf.portWin": "COM16",
+  "files.associations": {
+    "user_encoder_bsp.h": "c",
+    "lcd_touch_bsp.h": "c",
+    "iot_knob.h": "c",
+    "bidi_switch_knob.h": "c",
+    "user_config.h": "c"
+  },
+  "idf.espIdfPathWin": "e:\\v5_3_2\\v5.3.2\\esp-idf",
+  "idf.toolsPathWin": "e:\\v5_3_2\\Espressif",
+  "idf.pythonInstallPath": "e:\\v5_3_2\\Espressif\\tools\\idf-python\\3.11.2\\python.exe",
+  "idf.currentSetup": "C:\\esp\\v6.0.2\\esp-idf",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=c:\\Users\\Tom\\Documents\\ESP-IDF\\08_LVGL_Test\\build"
+  ],
+  "dotnet.preferCSharpExtension": true,
+  "idf.flashType": "UART",
+  "dotnet.defaultSolution": "disable"
+}
