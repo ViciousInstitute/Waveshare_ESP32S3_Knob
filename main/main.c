@@ -23,6 +23,9 @@
 static const char *TAG = "example";
 static SemaphoreHandle_t lvgl_mux = NULL;
 
+static lv_obj_t *menu_cont = NULL;
+static volatile int32_t encoder_steps = 0;
+
 #if CONFIG_LV_COLOR_DEPTH == 32
 #define LCD_BIT_PER_PIXEL (24)
 #elif CONFIG_LV_COLOR_DEPTH == 16
@@ -214,88 +217,278 @@ static const sh8601_lcd_init_cmd_t lcd_init_cmds[] = {
     {0x21, (uint8_t[]){0x00}, 1, 0},
     {0x11, (uint8_t[]){0x00}, 1, 120},
     {0x29, (uint8_t[]){0x00}, 1, 0},
-#ifdef Rotate_90
-    {0x36, (uint8_t[]){0x60}, 1, 0},
-#else
-    {0x36, (uint8_t[]){0x00}, 1, 0},
-#endif
+    // Rotate SH8601 display 180 degrees in hardware
+    {0x36, (uint8_t[]){0xC0}, 1, 0},
 };
 
-static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
+static void create_main_menu(void);
+static void create_second_menu(void);
+static void open_second_menu_cb(lv_event_t *e);
+static void back_to_main_menu_cb(lv_event_t *e);
+
+static void open_second_menu_cb(lv_event_t *e)
 {
-    lv_disp_drv_t *disp_driver = (lv_disp_drv_t *)user_ctx;
-    lv_disp_flush_ready(disp_driver);
+    if (menu_cont != NULL)
+    {
+        lv_obj_delete(menu_cont);
+        menu_cont = NULL;
+    }
+
+    create_second_menu();
+}
+static void create_main_menu(void)
+{
+    menu_cont = lv_obj_create(lv_screen_active());
+
+    lv_obj_set_size(menu_cont, 360, 360);
+    lv_obj_center(menu_cont);
+
+    lv_obj_set_flex_flow(
+        menu_cont,
+        LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_set_flex_align(
+        menu_cont,
+        LV_FLEX_ALIGN_START,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_set_scroll_snap_y(
+        menu_cont,
+        LV_SCROLL_SNAP_CENTER);
+
+    lv_obj_set_style_pad_top(menu_cont, 140, 0);
+    lv_obj_set_style_pad_bottom(menu_cont, 140, 0);
+    lv_obj_set_style_pad_row(menu_cont, 20, 0);
+
+    lv_obj_t *label1 =
+        lv_label_create(menu_cont);
+
+    lv_label_set_text(
+        label1,
+        "Main Menu");
+
+    lv_obj_t *btn1 =
+        lv_button_create(menu_cont);
+
+    lv_obj_set_size(
+        btn1,
+        200,
+        50);
+
+    lv_obj_t *btn_lbl =
+        lv_label_create(btn1);
+
+    lv_label_set_text(
+        btn_lbl,
+        "Open Settings");
+
+    lv_obj_center(btn_lbl);
+
+    /*
+     * This is what makes touching the button
+     * open the second menu.
+     */
+    lv_obj_add_event_cb(
+        btn1,
+        open_second_menu_cb,
+        LV_EVENT_CLICKED,
+        NULL);
+}
+
+static void create_second_menu(void)
+{
+    menu_cont = lv_obj_create(lv_screen_active());
+
+    lv_obj_set_size(menu_cont, 360, 360);
+    lv_obj_center(menu_cont);
+
+    lv_obj_set_flex_flow(
+        menu_cont,
+        LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_set_flex_align(
+        menu_cont,
+        LV_FLEX_ALIGN_START,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_set_scroll_snap_y(
+        menu_cont,
+        LV_SCROLL_SNAP_CENTER);
+
+    lv_obj_set_style_pad_top(menu_cont, 140, 0);
+    lv_obj_set_style_pad_bottom(menu_cont, 140, 0);
+    lv_obj_set_style_pad_row(menu_cont, 20, 0);
+
+    lv_obj_t *title =
+        lv_label_create(menu_cont);
+
+    lv_label_set_text(
+        title,
+        "Settings");
+
+    lv_obj_t *brightness =
+        lv_slider_create(menu_cont);
+
+    lv_obj_set_size(
+        brightness,
+        200,
+        20);
+
+    lv_slider_set_range(
+        brightness,
+        0,
+        100);
+
+    lv_slider_set_value(
+        brightness,
+        75,
+        LV_ANIM_OFF);
+
+    lv_obj_t *volume =
+        lv_arc_create(menu_cont);
+
+    lv_obj_set_size(
+        volume,
+        150,
+        150);
+
+    lv_arc_set_range(
+        volume,
+        0,
+        100);
+
+    lv_arc_set_value(
+        volume,
+        50);
+
+    lv_obj_t *back_btn =
+        lv_button_create(menu_cont);
+
+    lv_obj_set_size(
+        back_btn,
+        200,
+        50);
+
+    lv_obj_t *back_label =
+        lv_label_create(back_btn);
+
+    lv_label_set_text(
+        back_label,
+        "Back");
+
+    lv_obj_center(back_label);
+
+    lv_obj_add_event_cb(
+        back_btn,
+        back_to_main_menu_cb,
+        LV_EVENT_CLICKED,
+        NULL);
+}
+
+static void back_to_main_menu_cb(lv_event_t *e)
+{
+    if (menu_cont != NULL)
+    {
+        lv_obj_delete(menu_cont);
+        menu_cont = NULL;
+    }
+
+    create_main_menu();
+}
+
+static bool notify_lvgl_flush_ready(
+    esp_lcd_panel_io_handle_t panel_io,
+    esp_lcd_panel_io_event_data_t *edata,
+    void *user_ctx)
+{
+    lv_display_t *disp =
+        (lv_display_t *)user_ctx;
+
+    if (disp != NULL)
+    {
+        lv_display_flush_ready(disp);
+    }
+
     return false;
 }
 
-static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
+static void lvgl_flush_cb(
+    lv_display_t *disp,
+    const lv_area_t *area,
+    uint8_t *px_map)
 {
-    esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t)drv->user_data;
-    const int offsetx1 = area->x1;
-    const int offsetx2 = area->x2;
-    const int offsety1 = area->y1;
-    const int offsety2 = area->y2;
+    esp_lcd_panel_handle_t panel_handle =
+        (esp_lcd_panel_handle_t)
+            lv_display_get_user_data(disp);
 
-#if LCD_BIT_PER_PIXEL == 24
-    uint8_t *to = (uint8_t *)color_map;
-    uint8_t temp = 0;
-    uint16_t pixel_num = (offsetx2 - offsetx1 + 1) * (offsety2 - offsety1 + 1);
+    uint32_t pixel_count =
+        (area->x2 - area->x1 + 1) *
+        (area->y2 - area->y1 + 1);
 
-    // Special dealing for first pixel
-    temp = color_map[0].ch.blue;
-    *to++ = color_map[0].ch.red;
-    *to++ = color_map[0].ch.green;
-    *to++ = temp;
-    // Normal dealing for other pixels
-    for (int i = 1; i < pixel_num; i++)
+    uint16_t *pixels = (uint16_t *)px_map;
+
+    // SH8601 expects opposite RGB565 byte order
+    for (uint32_t i = 0; i < pixel_count; i++)
     {
-        *to++ = color_map[i].ch.red;
-        *to++ = color_map[i].ch.green;
-        *to++ = color_map[i].ch.blue;
+        pixels[i] =
+            (pixels[i] >> 8) |
+            (pixels[i] << 8);
     }
-#endif
 
-    // copy a buffer's content to a specific area of the display
-    esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
+    esp_lcd_panel_draw_bitmap(
+        panel_handle,
+        area->x1,
+        area->y1,
+        area->x2 + 1,
+        area->y2 + 1,
+        px_map);
 }
 
-void lvgl_rounder_cb(struct _lv_disp_drv_t *disp_drv, lv_area_t *area)
+static void lvgl_rounder_event_cb(lv_event_t *e)
 {
+    lv_area_t *area = lv_event_get_param(e);
+
     uint16_t x1 = area->x1;
     uint16_t x2 = area->x2;
-
     uint16_t y1 = area->y1;
     uint16_t y2 = area->y2;
 
-    // round the start of coordinate down to the nearest 2M number
     area->x1 = (x1 >> 1) << 1;
     area->y1 = (y1 >> 1) << 1;
-    // round the end of coordinate up to the nearest 2N+1 number
+
     area->x2 = ((x2 >> 1) << 1) + 1;
     area->y2 = ((y2 >> 1) << 1) + 1;
 }
 
 #if USE_TOUCH
-static void lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
+static void lvgl_touch_cb(
+    lv_indev_t *indev,
+    lv_indev_data_t *data)
 {
     uint16_t tp_x;
     uint16_t tp_y;
-    uint8_t win = tpGetCoordinates(&tp_x, &tp_y);
-    if (win)
+
+    uint8_t touched =
+        tpGetCoordinates(&tp_x, &tp_y);
+
+    if (touched)
     {
-#ifdef Rotate_90
-        data->point.x = tp_y;
-        data->point.y = (LCD_V_RES - tp_x);
-#else
-        data->point.x = tp_x;
-        data->point.y = tp_y;
-#endif
-        if (data->point.x > LCD_H_RES)
-            data->point.x = LCD_H_RES;
-        if (data->point.y > LCD_V_RES)
-            data->point.y = LCD_V_RES;
+        // Match hardware 180-degree LCD rotation
+        data->point.x =
+            (LCD_H_RES - 1) - tp_x;
+
+        data->point.y =
+            (LCD_V_RES - 1) - tp_y;
+
+        if (data->point.x >= LCD_H_RES)
+            data->point.x = LCD_H_RES - 1;
+
+        if (data->point.y >= LCD_V_RES)
+            data->point.y = LCD_V_RES - 1;
+
         data->state = LV_INDEV_STATE_PRESSED;
-        // ESP_LOGE("TP","(%d,%d)",data->point.x,data->point.y);
     }
     else
     {
@@ -369,55 +562,66 @@ void backlight_test_task(void *arg)
     }
 }
 #endif
-// int16_t knobScaled = 0;
+
 static void user_encoder_loop_task(void *arg)
 {
-    int8_t vol = 10;
     for (;;)
     {
-        EventBits_t even = xEventGroupWaitBits(knob_even_, BIT_EVEN_ALL, pdTRUE, pdFALSE, pdMS_TO_TICKS(5000));
-        if (READ_BIT(even, 0))
+        EventBits_t event = xEventGroupWaitBits(
+            knob_even_,
+            BIT_EVEN_ALL,
+            pdTRUE,
+            pdFALSE,
+            portMAX_DELAY);
+
+        if (READ_BIT(event, 0))
         {
-            vol--;
-            if (vol <= 0)
-                vol = 0;
-            printf("vol:%d\n", vol);
+            encoder_steps--;
         }
-        if (READ_BIT(even, 1))
+
+        if (READ_BIT(event, 1))
         {
-            vol++;
-            if (vol >= 100)
-                vol = 100;
-            printf("vol:%d\n", vol);
+            encoder_steps++;
         }
-        //    knobScaled = vol;
     }
 }
-// Test Callback Function for LVGL Input Device Driver
-//  void user_encoder_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
-//  {
-//      // 1. Read the relative step changes from your hardware/driver
-//      // Example: int32_t current_diff = get_esp32_encoder_diff();
-//      data->enc_diff = current_diff;
 
-//     // 2. Read the hardware button pin state
-//     // Example: bool pin_pressed = (gpio_get_level(ENCODER_KEY_PIN) == 0);
-//     if (pin_pressed)
-//     {
-//         data->state = LV_INDEV_STATE_PRESSED;
-//     }
-//     else
-//     {
-//         data->state = LV_INDEV_STATE_RELEASED;
-//     }
-// }
-// End Test Callback Function for LVGL Input Device Driver
+static void encoder_scroll_timer_cb(lv_timer_t *timer)
+{
+    if (menu_cont == NULL)
+    {
+        return;
+    }
+
+    int32_t steps = encoder_steps;
+
+    if (steps == 0)
+    {
+        return;
+    }
+
+    encoder_steps = 0;
+
+    /*
+     * Positive and negative directions may need reversing
+     * depending on how the bezel feels physically.
+     */
+    const int32_t scroll_per_step = 20;
+
+    lv_obj_scroll_by_bounded(
+        menu_cont,
+        0,
+        -steps * scroll_per_step,
+        LV_ANIM_OFF);
+}
 void app_main(void)
 {
 
-    static lv_disp_draw_buf_t disp_buf; // contains internal graphic buffer(s) called draw buffer(s)
-    static lv_disp_drv_t disp_drv;      // contains callback functions
+    ESP_LOGI(TAG, "ENTERED app_main");
 
+    static lv_display_t *disp = NULL; // contains callback functions
+
+    ESP_LOGI(TAG, "STEP 1: backlight");
     lcd_bl_pwm_bsp_init(LCD_PWM_MODE_255);
 
     ESP_LOGI(TAG, "Initialize SPI bus");
@@ -430,13 +634,16 @@ void app_main(void)
             .data3_io_num = PIN_NUM_LCD_DATA3,
             .max_transfer_sz = LCD_H_RES * LCD_V_RES * sizeof(uint16_t),
         };
+
+    ESP_LOGI(TAG, "STEP 2: SPI init");
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
+    ESP_LOGI(TAG, "STEP 3: panel IO");
     ESP_LOGI(TAG, "Install panel IO");
     esp_lcd_panel_io_handle_t io_handle = NULL;
     const esp_lcd_panel_io_spi_config_t io_config = SH8601_PANEL_IO_QSPI_CONFIG(PIN_NUM_LCD_CS,
                                                                                 notify_lvgl_flush_ready,
-                                                                                &disp_drv);
+                                                                                NULL);
     sh8601_vendor_config_t vendor_config = {
         .init_cmds = lcd_init_cmds,
         .init_cmds_size = sizeof(lcd_init_cmds) / sizeof(lcd_init_cmds[0]),
@@ -454,37 +661,86 @@ void app_main(void)
         .bits_per_pixel = LCD_BIT_PER_PIXEL,
         .vendor_config = &vendor_config,
     };
+    ESP_LOGI(TAG, "STEP 4: install panel driver");
     ESP_LOGI(TAG, "Install SH8601 panel driver");
     ESP_ERROR_CHECK(esp_lcd_new_panel_sh8601(io_handle, &panel_config, &panel_handle));
+
+    ESP_LOGI(TAG, "STEP 5: panel reset");
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
+
+    ESP_LOGI(TAG, "STEP 6: panel init");
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+
+    ESP_LOGI(TAG, "STEP 7: I2C");
     i2c_master_Init(); // I2C_Init
+
 #if USE_TOUCH
     lcd_touch_init();
 #endif
 
     ESP_LOGI(TAG, "Initialize LVGL library");
+    ESP_LOGI(TAG, "STEP 8: LVGL init");
     lv_init();
 
-    // alloc draw buffers used by LVGL
-    // it's recommended to choose the size of the draw buffer(s) to be at least 1/10 screen sized
-    lv_color_t *buf1 = (lv_color_t *)heap_caps_malloc(LCD_H_RES * LVGL_BUF_HEIGHT * sizeof(lv_color_t), MALLOC_CAP_DMA);
+    ESP_LOGI(TAG, "Allocate LVGL draw buffers");
+
+    const size_t draw_buf_size =
+        LCD_H_RES *
+        LVGL_BUF_HEIGHT *
+        sizeof(uint16_t);
+
+    uint8_t *buf1 = heap_caps_malloc(
+        draw_buf_size,
+        MALLOC_CAP_DMA);
     assert(buf1);
-    lv_color_t *buf2 = (lv_color_t *)heap_caps_malloc(LCD_H_RES * LVGL_BUF_HEIGHT * sizeof(lv_color_t), MALLOC_CAP_DMA);
+
+    uint8_t *buf2 = heap_caps_malloc(
+        draw_buf_size,
+        MALLOC_CAP_DMA);
     assert(buf2);
-    // initialize LVGL draw buffers
-    lv_disp_draw_buf_init(&disp_buf, buf1, buf2, LCD_H_RES * LVGL_BUF_HEIGHT);
 
     ESP_LOGI(TAG, "Register display driver to LVGL");
-    lv_disp_drv_init(&disp_drv);
 
-    disp_drv.hor_res = LCD_H_RES;
-    disp_drv.ver_res = LCD_V_RES;
-    disp_drv.flush_cb = lvgl_flush_cb;
-    disp_drv.rounder_cb = lvgl_rounder_cb;
-    disp_drv.draw_buf = &disp_buf;
-    disp_drv.user_data = panel_handle;
-    lv_disp_t *disp = lv_disp_drv_register(&disp_drv);
+    disp = lv_display_create(
+        LCD_H_RES,
+        LCD_V_RES);
+
+    assert(disp);
+
+    lv_display_set_color_format(
+        disp,
+        LV_COLOR_FORMAT_RGB565);
+
+    lv_display_set_buffers(
+        disp,
+        buf1,
+        buf2,
+        draw_buf_size,
+        LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+    lv_display_set_flush_cb(
+        disp,
+        lvgl_flush_cb);
+
+    lv_display_set_user_data(
+        disp,
+        panel_handle);
+
+    lv_display_add_event_cb(
+        disp,
+        lvgl_rounder_event_cb,
+        LV_EVENT_INVALIDATE_AREA,
+        NULL);
+
+    const esp_lcd_panel_io_callbacks_t io_callbacks = {
+        .on_color_trans_done = notify_lvgl_flush_ready,
+    };
+
+    ESP_ERROR_CHECK(
+        esp_lcd_panel_io_register_event_callbacks(
+            io_handle,
+            &io_callbacks,
+            disp));
 
     ESP_LOGI(TAG, "Install LVGL tick timer");
     // Tick interface for LVGL (using esp_timer to generate 2ms periodic event)
@@ -496,81 +752,66 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, LVGL_TICK_PERIOD_MS * 1000));
 
 #if USE_TOUCH
-    static lv_indev_drv_t indev_drv; // Input device driver (Touch)
-    lv_indev_drv_init(&indev_drv);
-    indev_drv.type = LV_INDEV_TYPE_POINTER;
-    indev_drv.disp = disp;
-    indev_drv.read_cb = lvgl_touch_cb;
-    lv_indev_drv_register(&indev_drv);
+    lv_indev_t *touch_indev =
+        lv_indev_create();
+
+    assert(touch_indev);
+
+    lv_indev_set_type(
+        touch_indev,
+        LV_INDEV_TYPE_POINTER);
+
+    lv_indev_set_display(
+        touch_indev,
+        disp);
+
+    lv_indev_set_read_cb(
+        touch_indev,
+        lvgl_touch_cb);
 #endif
 
-    // Start Test Encoder LVGL Input
-    // #if USE_ENCODER
-    //     static lv_indev_drv_t encoder_indev_drv; // Input device driver (Encoder)
-    //     lv_indev_drv_init(&encoder_indev_drv);
-    //     encoder_indev_drv.type = LV_INDEV_TYPE_ENCODER;
-    //     encoder_indev_drv.disp = disp;
-    //     encoder_indev_drv.read_cb = user_encoder_read_cb;
-    //     lv_indev_drv_register(&encoder_indev_drv);
-    // #endif
-
-    // End Test Encoder LVGL Input
+    // ----------------------------
+    // Encoder input
+    // ----------------------------
 
     lvgl_mux = xSemaphoreCreateMutex();
     assert(lvgl_mux);
     xTaskCreate(lvgl_port_task, "LVGL", LVGL_TASK_STACK_SIZE, NULL, LVGL_TASK_PRIORITY, NULL);
+
 #ifdef Backlight_Testing
     xTaskCreate(backlight_test_task, "backlight", 3 * 1024, NULL, 2, NULL);
 #endif
 
     user_encoder_init();
-    xTaskCreate(user_encoder_loop_task, "user_encoder_loop_task", 3000, NULL, 2, NULL);
+    xTaskCreate(
+        user_encoder_loop_task,
+        "user_encoder_loop_task",
+        3000,
+        NULL,
+        2,
+        NULL);
 
+    lv_timer_create(
+        encoder_scroll_timer_cb,
+        5,
+        NULL);
     // draw items here
 
     ESP_LOGI(TAG, "Display UI");
+
     if (lvgl_lock(-1))
     {
-        // Disable default scrollbars on the main background screen
-        lv_obj_set_scrollbar_mode(lv_scr_act(), LV_SCROLLBAR_MODE_OFF);
+        lv_obj_set_scrollbar_mode(
+            lv_screen_active(),
+            LV_SCROLLBAR_MODE_OFF);
 
-        // 1. Create a container designed specifically for a round screen
-        lv_obj_t *cont = lv_obj_create(lv_scr_act());
-        lv_obj_set_size(cont, 360, 360);
-        lv_obj_center(cont);
+        create_main_menu();
 
-        // 2. Format it into a vertical column layout (Flex column)
-        lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_timer_create(
+            encoder_scroll_timer_cb,
+            5,
+            NULL);
 
-        // 3. Enable snapping so elements always align directly in the center circle
-        lv_obj_set_scroll_snap_y(cont, LV_SCROLL_SNAP_CENTER);
-
-        // 4. Force elements to have padding top/bottom so the first/last item can reach the center
-        lv_obj_set_style_pad_top(cont, 140, 0);
-        lv_obj_set_style_pad_bottom(cont, 140, 0);
-        lv_obj_set_style_pad_row(cont, 20, 0); // Spacing between your text/widgets
-
-        // 5. Build your actual UI elements inside this container 'cont'
-        // Let's create an example layout of elements that adapt perfectly:
-
-        lv_obj_t *label1 = lv_label_create(cont);
-        lv_label_set_text(label1, "First Settings Item");
-
-        lv_obj_t *btn1 = lv_btn_create(cont);
-        lv_obj_set_size(btn1, 200, 50); // Kept inside safe 360 margins
-        lv_obj_t *btn_lbl = lv_label_create(btn1);
-        lv_label_set_text(btn_lbl, "Click Me");
-        lv_obj_center(btn_lbl);
-
-        lv_obj_t *label2 = lv_label_create(cont);
-        lv_label_set_text(label2, "Second Menu Option");
-
-        lv_obj_t *arc = lv_arc_create(cont);
-        lv_obj_set_size(arc, 150, 150); // Arcs look great on circles
-        lv_arc_set_value(arc, 360);
-
-        // Release the mutex
         lvgl_unlock();
     }
 }

@@ -33,7 +33,7 @@
 #define LVGL_TICK_PERIOD_MS    2
 #define LVGL_TASK_MAX_DELAY_MS 500
 #define LVGL_TASK_MIN_DELAY_MS 5
-#define LVGL_TASK_STACK_SIZE   (4 * 1024)
+#define LVGL_TASK_STACK_SIZE   (16 * 1024)
 #define LVGL_TASK_PRIORITY     2
 
 #define USE_TOUCH  1 //Without tp ---- Touch off
