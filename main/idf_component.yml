@@ -7,5 +7,7 @@ dependencies:
     public: true
 
   lvgl/lvgl:
-    version: "8.4.0"
-    public: true
+    version: "^9.5.0"
+
+  espressif/esp_lvgl_port:
+    version: "^2.9.0"

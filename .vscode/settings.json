@@ -25,6 +25,6 @@
     "--compile-commands-dir=c:\\Users\\Tom\\Documents\\ESP-IDF\\08_LVGL_Test\\build"
   ],
   "dotnet.preferCSharpExtension": true,
-  "idf.flashType": "UART",
+  "idf.flashType": "JTAG",
   "dotnet.defaultSolution": "disable"
 }
