@@ -1,3 +1,18 @@
+/* ============================================================================
+ * Waveshare ESP32-S3-Knob-Touch-LCD-1.8
+ * LVGL 9 application + hardware diagnostics
+ *
+ * Major sections:
+ *   1. Includes and global state
+ *   2. LCD initialization data
+ *   3. Menu/navigation declarations
+ *   4. DRV2605 haptic driver
+ *   5. Menu implementation
+ *   6. LVGL display/touch bridge
+ *   7. FreeRTOS tasks
+ *   8. app_main hardware initialization
+ * ========================================================================== */
+
 #include <stdio.h>
 
 #include "freertos/FreeRTOS.h"
@@ -10,7 +25,9 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_err.h"
+#include "esp_check.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "lvgl.h"
 #include "lv_demos.h"
 #include "esp_lcd_sh8601.h"
@@ -20,18 +37,70 @@
 #include "lcd_bl_pwm_bsp.h"
 #include "user_encoder_bsp.h"
 
+/* ============================================================================
+ * 1. GLOBAL APPLICATION STATE
+ * ========================================================================== */
+
+/*
+ * Shared ESP-IDF logging tag used by this source file.
+ */
 static const char *TAG = "example";
+
+/*
+ * LVGL mutex.
+ *
+ * LVGL is not generally thread-safe. FreeRTOS tasks must take this mutex before
+ * manipulating LVGL objects or calling LVGL APIs from outside the LVGL task.
+ */
 static SemaphoreHandle_t lvgl_mux = NULL;
 
+/*
+ * Current scrollable menu container.
+ *
+ * The encoder scroll handler always acts on this pointer, so the same bezel
+ * code works on Main, Settings, Hardware Tests, and every submenu.
+ */
 static lv_obj_t *menu_cont = NULL;
+
+/*
+ * Encoder movement shared between the hardware task and the LVGL timer.
+ * The hardware task only accumulates raw steps; it never calls LVGL directly.
+ */
 static volatile int32_t encoder_steps = 0;
+
+/* Number of vertical pixels applied for one bezel step. */
+static int32_t encoder_scroll_per_step = 20;
+
+/*
+ * Hardware diagnostic page state.
+ *
+ * These LVGL object pointers are only valid while the corresponding test pages
+ * are visible. show_menu() clears them before deleting the old container.
+ */
+static lv_obj_t *touch_test_label = NULL;
+static lv_obj_t *encoder_test_label = NULL;
+static int32_t encoder_test_count = 0;
+
+/* Last PWM duty selected by the backlight test (0..255). */
+static uint8_t backlight_test_level = 255;
+
+/* Label used by the generic "driver not integrated" test page. */
+static const char *unavailable_hw_name = "Peripheral";
+
+/* ============================================================================
+ * 2. DISPLAY CONFIGURATION
+ * ========================================================================== */
 
 #if CONFIG_LV_COLOR_DEPTH == 32
 #define LCD_BIT_PER_PIXEL (24)
 #elif CONFIG_LV_COLOR_DEPTH == 16
 #define LCD_BIT_PER_PIXEL (16)
 #endif
-// d5-d7
+/*
+ * SH8601 panel initialization table.
+ * This is board/panel-specific data inherited from the Waveshare example.
+ * Avoid changing individual register values unless debugging the panel itself.
+ */
 static const sh8601_lcd_init_cmd_t lcd_init_cmds[] = {
     {0xF0, (uint8_t[]){0x28}, 1, 0},
     {0xF2, (uint8_t[]){0x28}, 1, 0},
@@ -221,182 +290,1217 @@ static const sh8601_lcd_init_cmd_t lcd_init_cmds[] = {
     {0x36, (uint8_t[]){0xC0}, 1, 0},
 };
 
-static void create_main_menu(void);
-static void create_second_menu(void);
-static void open_second_menu_cb(lv_event_t *e);
-static void back_to_main_menu_cb(lv_event_t *e);
+/* ============================================================================
+ * 3. MENU / NAVIGATION DECLARATIONS
+ * ========================================================================== */
 
-static void open_second_menu_cb(lv_event_t *e)
+typedef enum
 {
+    MENU_MAIN,
+    MENU_SETTINGS,
+    MENU_DISPLAY,
+    MENU_AUDIO,
+    MENU_INPUT,
+    MENU_ABOUT,
+
+    MENU_HARDWARE_TESTS,
+    MENU_HW_DISPLAY,
+    MENU_HW_TOUCH,
+    MENU_HW_ENCODER,
+    MENU_HW_BACKLIGHT,
+    MENU_HW_MEMORY,
+    MENU_HW_HAPTICS,
+    MENU_HW_UNAVAILABLE
+} menu_id_t;
+
+/*
+ * Menu navigation history.
+ *
+ * push_menu() stores the current page before moving forward.
+ * pop_menu() restores the previous page when Back is pressed.
+ */
+#define MENU_STACK_SIZE 12
+
+static menu_id_t current_menu = MENU_MAIN;
+static menu_id_t menu_stack[MENU_STACK_SIZE];
+
+/* -1 means the navigation history is empty. */
+static int menu_stack_top = -1;
+
+static lv_obj_t *create_menu_container(void);
+static lv_obj_t *create_menu_button(lv_obj_t *parent, const char *text, lv_event_cb_t callback);
+
+static void show_menu(menu_id_t menu);
+static void push_menu(menu_id_t menu);
+static void pop_menu(void);
+
+static void create_main_menu(void);
+static void create_settings_menu(void);
+static void create_display_menu(void);
+static void create_audio_menu(void);
+static void create_input_menu(void);
+static void create_about_menu(void);
+
+static void create_hardware_tests_menu(void);
+static void create_hw_display_test_menu(void);
+static void create_hw_touch_test_menu(void);
+static void create_hw_encoder_test_menu(void);
+static void create_hw_backlight_test_menu(void);
+static void create_hw_memory_test_menu(void);
+static void create_hw_haptics_test_menu(void);
+static void create_hw_unavailable_menu(void);
+
+static void open_settings_cb(lv_event_t *e);
+static void open_display_cb(lv_event_t *e);
+static void open_audio_cb(lv_event_t *e);
+static void open_input_cb(lv_event_t *e);
+static void open_about_cb(lv_event_t *e);
+static void open_hardware_tests_cb(lv_event_t *e);
+
+static void open_hw_display_cb(lv_event_t *e);
+static void open_hw_touch_cb(lv_event_t *e);
+static void open_hw_encoder_cb(lv_event_t *e);
+static void open_hw_backlight_cb(lv_event_t *e);
+static void open_hw_memory_cb(lv_event_t *e);
+static void open_hw_sd_cb(lv_event_t *e);
+static void open_hw_haptics_cb(lv_event_t *e);
+static void open_hw_audio_mic_cb(lv_event_t *e);
+static void open_hw_battery_cb(lv_event_t *e);
+static void open_hw_wireless_cb(lv_event_t *e);
+
+static void back_cb(lv_event_t *e);
+static void bezel_sensitivity_changed_cb(lv_event_t *e);
+static void backlight_test_changed_cb(lv_event_t *e);
+
+/* Haptic menu callbacks */
+static void haptic_strong_click_cb(lv_event_t *e);
+static void haptic_double_click_cb(lv_event_t *e);
+static void haptic_buzz_cb(lv_event_t *e);
+static void haptic_soft_bump_cb(lv_event_t *e);
+static void haptic_stop_cb(lv_event_t *e);
+static void haptic_rtp_test_cb(lv_event_t *e);
+static void button_press_haptic_cb(lv_event_t *e);
+
+/* DRV2605 driver helpers */
+static esp_err_t drv2605_read_reg(uint8_t reg, uint8_t *value);
+static esp_err_t drv2605_write_reg(uint8_t reg, uint8_t value);
+static esp_err_t drv2605_init(void);
+static esp_err_t drv2605_play_effect(uint8_t effect);
+static esp_err_t drv2605_stop(void);
+static esp_err_t drv2605_rtp_start(uint8_t amplitude);
+static esp_err_t drv2605_rtp_stop(void);
+static void drv2605_rtp_test(void);
+static void drv2605_dump_registers(void);
+
+/* ============================================================================
+ * 4. DRV2605 HAPTIC DRIVER
+ * ============================================================================
+ *
+ * The DRV2605 shares the board's existing I2C bus with the touch controller.
+ * drv2605_dev_handle is created by i2c_bsp.c.
+ *
+ * Two playback paths are provided:
+ *   - Internal waveform library: drv2605_play_effect()
+ *   - Real-time playback (RTP): drv2605_rtp_start()/stop()
+ *
+ * RTP is useful as a hardware diagnostic because it bypasses the waveform
+ * sequencer and directly requests a drive amplitude.
+ * ========================================================================== */
+
+#define DRV2605_REG_STATUS 0x00
+#define DRV2605_REG_MODE 0x01
+#define DRV2605_REG_RTPIN 0x02
+#define DRV2605_REG_LIBRARY 0x03
+#define DRV2605_REG_WAVESEQ1 0x04
+#define DRV2605_REG_WAVESEQ2 0x05
+#define DRV2605_REG_GO 0x0C
+#define DRV2605_REG_OVERDRIVE 0x0D
+#define DRV2605_REG_SUSTAINPOS 0x0E
+#define DRV2605_REG_SUSTAINNEG 0x0F
+#define DRV2605_REG_BREAK 0x10
+#define DRV2605_REG_AUDIOMAX 0x13
+#define DRV2605_REG_FEEDBACK 0x1A
+#define DRV2605_REG_CONTROL3 0x1D
+
+/**
+ * @brief Read one DRV2605 register.
+ */
+static esp_err_t drv2605_read_reg(uint8_t reg, uint8_t *value)
+{
+    if (drv2605_dev_handle == NULL || value == NULL)
+    {
+        ESP_LOGE(TAG, "DRV2605 read attempted before device initialization");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = (esp_err_t)i2c_read_buff(
+        drv2605_dev_handle,
+        reg,
+        value,
+        1);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "DRV2605 read failed: reg=0x%02X err=%s",
+            reg,
+            esp_err_to_name(err));
+    }
+
+    return err;
+}
+
+/**
+ * @brief Write one DRV2605 register.
+ */
+static esp_err_t drv2605_write_reg(uint8_t reg, uint8_t value)
+{
+    if (drv2605_dev_handle == NULL)
+    {
+        ESP_LOGE(TAG, "DRV2605 write attempted before device initialization");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = (esp_err_t)i2c_write_buff(
+        drv2605_dev_handle,
+        reg,
+        &value,
+        1);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "DRV2605 write failed: reg=0x%02X value=0x%02X err=%s",
+            reg,
+            value,
+            esp_err_to_name(err));
+    }
+
+    return err;
+}
+
+/**
+ * @brief Dump the most useful DRV2605 diagnostic registers.
+ *
+ * This is intentionally small: STATUS proves the device can be read,
+ * MODE shows the active playback mode, and RTPIN confirms the requested
+ * direct-drive amplitude.
+ */
+static void drv2605_dump_registers(void)
+{
+    uint8_t status = 0;
+    uint8_t mode = 0;
+    uint8_t rtp = 0;
+    uint8_t feedback = 0;
+    uint8_t control3 = 0;
+
+    esp_err_t status_err = drv2605_read_reg(DRV2605_REG_STATUS, &status);
+    esp_err_t mode_err = drv2605_read_reg(DRV2605_REG_MODE, &mode);
+    esp_err_t rtp_err = drv2605_read_reg(DRV2605_REG_RTPIN, &rtp);
+    esp_err_t feedback_err = drv2605_read_reg(DRV2605_REG_FEEDBACK, &feedback);
+    esp_err_t control3_err = drv2605_read_reg(DRV2605_REG_CONTROL3, &control3);
+
+    if (status_err == ESP_OK &&
+        mode_err == ESP_OK &&
+        rtp_err == ESP_OK &&
+        feedback_err == ESP_OK &&
+        control3_err == ESP_OK)
+    {
+        ESP_LOGI(
+            TAG,
+            "DRV2605 regs: STATUS=0x%02X MODE=0x%02X RTP=0x%02X "
+            "FEEDBACK=0x%02X CONTROL3=0x%02X",
+            status,
+            mode,
+            rtp,
+            feedback,
+            control3);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "DRV2605 register dump incomplete because an I2C read failed");
+    }
+}
+
+/**
+ * @brief Initialize the DRV2605 for internal-trigger LRA operation.
+ *
+ * The onboard actuator was verified to vibrate correctly when configured as an
+ * LRA. Earlier ERM/open-loop settings allowed I2C communication to work but did
+ * not produce physical vibration.
+ *
+ * This initialization therefore:
+ *   1. Places the DRV2605 in internal-trigger mode.
+ *   2. Selects waveform library 1.
+ *   3. Sets FEEDBACK[7] = 1 (LRA).
+ *   4. Clears CONTROL3[5] (disable ERM open-loop).
+ *   5. Dumps useful registers for serial-monitor diagnostics.
+ */
+static esp_err_t drv2605_init(void)
+{
+    ESP_LOGI(TAG, "Initializing DRV2605");
+
+    uint8_t status = 0;
+    esp_err_t err = drv2605_read_reg(DRV2605_REG_STATUS, &status);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "DRV2605 not responding: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "DRV2605 status register = 0x%02X", status);
+
+    /* Internal-trigger mode and out of standby. */
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_MODE, 0x00),
+        TAG,
+        "Failed to set DRV2605 internal-trigger mode");
+
+    /* Clear real-time-playback input while using the waveform library. */
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_RTPIN, 0x00),
+        TAG,
+        "Failed to clear DRV2605 RTP input");
+
+    /* Select waveform library 1 and terminate sequence after slot 1. */
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_LIBRARY, 0x01),
+        TAG,
+        "Failed to select DRV2605 waveform library");
+
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_WAVESEQ1, 1),
+        TAG,
+        "Failed to initialize DRV2605 waveform slot 1");
+
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_WAVESEQ2, 0),
+        TAG,
+        "Failed to terminate DRV2605 waveform sequence");
+
+    /* Clear timing overrides. */
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_OVERDRIVE, 0),
+        TAG,
+        "Failed to clear DRV2605 overdrive");
+
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_SUSTAINPOS, 0),
+        TAG,
+        "Failed to clear DRV2605 positive sustain");
+
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_SUSTAINNEG, 0),
+        TAG,
+        "Failed to clear DRV2605 negative sustain");
+
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_BREAK, 0),
+        TAG,
+        "Failed to clear DRV2605 brake time");
+
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_AUDIOMAX, 0x64),
+        TAG,
+        "Failed to configure DRV2605 audio max");
+
+    /*
+     * Select the actuator type.
+     *
+     * FEEDBACK register bit 7:
+     *   0 = ERM (eccentric rotating mass motor)
+     *   1 = LRA (linear resonant actuator)
+     *
+     * The board's actuator is being operated as an LRA because that is the
+     * configuration that produced real vibration during hardware testing.
+     */
+    uint8_t feedback = 0;
+    ESP_RETURN_ON_ERROR(
+        drv2605_read_reg(DRV2605_REG_FEEDBACK, &feedback),
+        TAG,
+        "Failed to read DRV2605 feedback register");
+    /* Set FEEDBACK[7] to select LRA operation. */
+    feedback |= 0x80;
+
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_FEEDBACK, feedback),
+        TAG,
+        "Failed to configure DRV2605 for LRA");
+
+    /*
+     * CONTROL3[5] is ERM_OPEN_LOOP.
+     *
+     * Because this project uses LRA mode, this bit must remain cleared.
+     */
+    uint8_t control3 = 0;
+    ESP_RETURN_ON_ERROR(
+        drv2605_read_reg(DRV2605_REG_CONTROL3, &control3),
+        TAG,
+        "Failed to read DRV2605 CONTROL3");
+
+    /* Clear ERM_OPEN_LOOP while operating the actuator as an LRA. */
+    control3 &= (uint8_t)~0x20;
+
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_CONTROL3, control3),
+        TAG,
+        "Failed to disable DRV2605 ERM open-loop mode");
+
+    ESP_LOGI(TAG, "DRV2605 initialized successfully");
+    drv2605_dump_registers();
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Play a built-in DRV2605 waveform effect.
+ */
+static esp_err_t drv2605_play_effect(uint8_t effect)
+{
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_MODE, 0x00),
+        TAG,
+        "Failed to enter internal-trigger mode");
+
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_WAVESEQ1, effect),
+        TAG,
+        "Failed to set haptic effect");
+
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_WAVESEQ2, 0),
+        TAG,
+        "Failed to terminate haptic sequence");
+
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_GO, 1),
+        TAG,
+        "Failed to start haptic effect");
+
+    ESP_LOGI(TAG, "DRV2605 effect %u started", effect);
+    return ESP_OK;
+}
+
+/**
+ * @brief Stop internal-waveform playback.
+ */
+static esp_err_t drv2605_stop(void)
+{
+    return drv2605_write_reg(DRV2605_REG_GO, 0x00);
+}
+
+/**
+ * @brief Enter real-time playback mode at the requested amplitude.
+ *
+ * 0x7F is used as the strongest positive signed RTP value for diagnostics.
+ */
+static esp_err_t drv2605_rtp_start(uint8_t amplitude)
+{
+    ESP_LOGI(TAG, "DRV2605 RTP start, amplitude=%u", amplitude);
+
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_MODE, 0x05),
+        TAG,
+        "Failed to enter DRV2605 RTP mode");
+
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_RTPIN, amplitude),
+        TAG,
+        "Failed to set DRV2605 RTP amplitude");
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Stop RTP drive and return to internal-trigger mode.
+ */
+static esp_err_t drv2605_rtp_stop(void)
+{
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_RTPIN, 0x00),
+        TAG,
+        "Failed to clear DRV2605 RTP amplitude");
+
+    ESP_RETURN_ON_ERROR(
+        drv2605_write_reg(DRV2605_REG_MODE, 0x00),
+        TAG,
+        "Failed to leave DRV2605 RTP mode");
+
+    ESP_LOGI(TAG, "DRV2605 RTP stopped");
+    return ESP_OK;
+}
+
+/**
+ * @brief Run a short direct-drive haptic diagnostic.
+ *
+ * This currently blocks the LVGL event callback for 500 ms. That is acceptable
+ * for a deliberate hardware test page, but should not be used for normal UI
+ * haptic feedback.
+ */
+static void drv2605_rtp_test(void)
+{
+    ESP_LOGI(TAG, "Starting direct haptic RTP test");
+
+    drv2605_dump_registers();
+
+    esp_err_t err = drv2605_rtp_start(0x7F);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Unable to start RTP test: %s", esp_err_to_name(err));
+        return;
+    }
+
+    drv2605_dump_registers();
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    err = drv2605_rtp_stop();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Unable to stop RTP test cleanly: %s", esp_err_to_name(err));
+    }
+
+    drv2605_dump_registers();
+}
+
+/**
+ * @brief LVGL callback for the direct RTP diagnostic button.
+ */
+static void haptic_rtp_test_cb(lv_event_t *e)
+{
+    (void)e;
+    drv2605_rtp_test();
+}
+
+/* ============================================================================
+ * 5. MENU / UI IMPLEMENTATION
+ * ========================================================================== */
+
+/**
+ * @brief Create the common scrollable container used by every menu page.
+ *
+ * Centralizing the layout here keeps all pages consistent:
+ *   - Full logical display size
+ *   - Vertical flex layout
+ *   - Centered menu entries
+ *   - Vertical scroll snapping
+ *   - Hidden scrollbar
+ *   - Extra top/bottom padding so first/last items can reach the center of the
+ *     circular display
+ */
+static lv_obj_t *create_menu_container(void)
+{
+    lv_obj_t *cont = lv_obj_create(lv_screen_active());
+
+    lv_obj_set_size(cont, LCD_H_RES, LCD_V_RES);
+    lv_obj_center(cont);
+
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(
+        cont,
+        LV_FLEX_ALIGN_START,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_set_scroll_snap_y(cont, LV_SCROLL_SNAP_CENTER);
+    lv_obj_set_scrollbar_mode(cont, LV_SCROLLBAR_MODE_OFF);
+
+    /*
+     * Allow the first and last items to reach the center of the
+     * 360 x 360 circular display.
+     */
+    lv_obj_set_style_pad_top(cont, 140, 0);
+    lv_obj_set_style_pad_bottom(cont, 140, 0);
+    lv_obj_set_style_pad_row(cont, 20, 0);
+
+    return cont;
+}
+
+/**
+ * @brief Create one standard menu button.
+ *
+ * Each normal menu button intentionally has two event callbacks:
+ *
+ *   LV_EVENT_PRESSED
+ *       Runs immediately when the finger touches the button. This is used only
+ *       for tactile feedback so the interface feels responsive.
+ *
+ *   LV_EVENT_CLICKED
+ *       Runs after LVGL recognizes a complete press-and-release click. This is
+ *       used for the button's actual action (open a menu, go Back, etc.).
+ *
+ * Keeping these two jobs separate means haptic feedback happens immediately,
+ * while navigation still uses normal LVGL click semantics.
+ */
+static lv_obj_t *create_menu_button(
+    lv_obj_t *parent,
+    const char *text,
+    lv_event_cb_t callback)
+{
+    /* Create the button as a child of the supplied menu container. */
+    lv_obj_t *button = lv_button_create(parent);
+    lv_obj_set_size(button, 200, 50);
+
+    /* Create and center the text label inside the button. */
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_center(label);
+
+    /*
+     * Immediate tactile feedback on finger-down.
+     *
+     * This callback is intentionally separate from the actual button action.
+     */
+    lv_obj_add_event_cb(
+        button,
+        button_press_haptic_cb,
+        LV_EVENT_PRESSED,
+        NULL);
+
+    /*
+     * Attach the real menu/action callback only when one was supplied.
+     * Keeping NULL legal makes this helper reusable for display-only buttons.
+     */
+    if (callback != NULL)
+    {
+        lv_obj_add_event_cb(
+            button,
+            callback,
+            LV_EVENT_PRESSED,
+            NULL);
+    }
+
+    return button;
+}
+
+
+/**
+ * @brief Provide immediate generic haptic feedback for normal UI buttons.
+ *
+ * This callback is attached to LV_EVENT_PRESSED, so the vibration begins when
+ * the finger first touches the button rather than when it is released.
+ *
+ * The dedicated Haptic Motor Test page is excluded. Buttons on that page are
+ * supposed to demonstrate specific DRV2605 effects, and a generic click before
+ * every test would make those effects harder to judge.
+ */
+static void button_press_haptic_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (current_menu == MENU_HW_HAPTICS)
+    {
+        return;
+    }
+
+    /*
+     * Effect 1 is currently used as the normal UI click.
+     *
+     * ESP_ERROR_CHECK_WITHOUT_ABORT is deliberate: haptic feedback is optional
+     * UI polish. A haptic failure should be logged, but it should not reboot the
+     * entire display/menu application.
+     */
+    ESP_ERROR_CHECK_WITHOUT_ABORT(
+        drv2605_play_effect(1));
+}
+
+/**
+ * @brief Destroy the current menu and construct the requested menu.
+ *
+ * This function is the central router for the entire menu system.
+ */
+static void show_menu(menu_id_t menu)
+{
+    /*
+     * Clear test-widget pointers before deleting menu_cont. Deleting the parent
+     * also deletes all child LVGL objects.
+     */
+    touch_test_label = NULL;
+    encoder_test_label = NULL;
+
     if (menu_cont != NULL)
     {
         lv_obj_delete(menu_cont);
         menu_cont = NULL;
     }
 
-    create_second_menu();
+    current_menu = menu;
+    encoder_steps = 0;
+
+    switch (menu)
+    {
+    case MENU_MAIN:
+        create_main_menu();
+        break;
+    case MENU_SETTINGS:
+        create_settings_menu();
+        break;
+    case MENU_DISPLAY:
+        create_display_menu();
+        break;
+    case MENU_AUDIO:
+        create_audio_menu();
+        break;
+    case MENU_INPUT:
+        create_input_menu();
+        break;
+    case MENU_ABOUT:
+        create_about_menu();
+        break;
+    case MENU_HARDWARE_TESTS:
+        create_hardware_tests_menu();
+        break;
+    case MENU_HW_DISPLAY:
+        create_hw_display_test_menu();
+        break;
+    case MENU_HW_TOUCH:
+        create_hw_touch_test_menu();
+        break;
+    case MENU_HW_ENCODER:
+        create_hw_encoder_test_menu();
+        break;
+    case MENU_HW_BACKLIGHT:
+        create_hw_backlight_test_menu();
+        break;
+    case MENU_HW_MEMORY:
+        create_hw_memory_test_menu();
+        break;
+    case MENU_HW_HAPTICS:
+        create_hw_haptics_test_menu();
+        break;
+    case MENU_HW_UNAVAILABLE:
+        create_hw_unavailable_menu();
+        break;
+    default:
+        current_menu = MENU_MAIN;
+        create_main_menu();
+        break;
+    }
 }
+
+/**
+ * @brief Navigate forward while preserving the current page for Back.
+ */
+static void push_menu(menu_id_t menu)
+{
+    if (menu_stack_top < MENU_STACK_SIZE - 1)
+    {
+        menu_stack[++menu_stack_top] = current_menu;
+    }
+
+    show_menu(menu);
+}
+
+/**
+ * @brief Return to the most recently saved parent page.
+ */
+static void pop_menu(void)
+{
+    if (menu_stack_top >= 0)
+    {
+        menu_id_t previous = menu_stack[menu_stack_top--];
+        show_menu(previous);
+    }
+    else if (current_menu != MENU_MAIN)
+    {
+        show_menu(MENU_MAIN);
+    }
+}
+
+static void open_settings_cb(lv_event_t *e)
+{
+    (void)e;
+    push_menu(MENU_SETTINGS);
+}
+
+static void open_display_cb(lv_event_t *e)
+{
+    (void)e;
+    push_menu(MENU_DISPLAY);
+}
+
+static void open_audio_cb(lv_event_t *e)
+{
+    (void)e;
+    push_menu(MENU_AUDIO);
+}
+
+static void open_input_cb(lv_event_t *e)
+{
+    (void)e;
+    push_menu(MENU_INPUT);
+}
+
+static void open_about_cb(lv_event_t *e)
+{
+    (void)e;
+    push_menu(MENU_ABOUT);
+}
+
+static void open_hardware_tests_cb(lv_event_t *e)
+{
+    (void)e;
+    push_menu(MENU_HARDWARE_TESTS);
+}
+
+static void open_hw_display_cb(lv_event_t *e)
+{
+    (void)e;
+    push_menu(MENU_HW_DISPLAY);
+}
+
+static void open_hw_touch_cb(lv_event_t *e)
+{
+    (void)e;
+    push_menu(MENU_HW_TOUCH);
+}
+
+static void open_hw_encoder_cb(lv_event_t *e)
+{
+    (void)e;
+    encoder_test_count = 0;
+    push_menu(MENU_HW_ENCODER);
+}
+
+static void open_hw_backlight_cb(lv_event_t *e)
+{
+    (void)e;
+    push_menu(MENU_HW_BACKLIGHT);
+}
+
+static void open_hw_memory_cb(lv_event_t *e)
+{
+    (void)e;
+    push_menu(MENU_HW_MEMORY);
+}
+
+static void open_unavailable_hw(const char *name)
+{
+    unavailable_hw_name = name;
+    push_menu(MENU_HW_UNAVAILABLE);
+}
+
+static void open_hw_sd_cb(lv_event_t *e)
+{
+    (void)e;
+    open_unavailable_hw("TF / microSD card");
+}
+
+static void open_hw_haptics_cb(lv_event_t *e)
+{
+    (void)e;
+    push_menu(MENU_HW_HAPTICS);
+}
+
+static void open_hw_audio_mic_cb(lv_event_t *e)
+{
+    (void)e;
+    open_unavailable_hw("PCM5100A + digital MIC");
+}
+
+static void open_hw_battery_cb(lv_event_t *e)
+{
+    (void)e;
+    open_unavailable_hw("Battery / ADC");
+}
+
+static void open_hw_wireless_cb(lv_event_t *e)
+{
+    (void)e;
+    open_unavailable_hw("Wi-Fi / Bluetooth / secondary ESP32");
+}
+
+static void back_cb(lv_event_t *e)
+{
+    (void)e;
+    pop_menu();
+}
+
 static void create_main_menu(void)
 {
-    menu_cont = lv_obj_create(lv_screen_active());
+    menu_cont = create_menu_container();
 
-    lv_obj_set_size(menu_cont, 360, 360);
-    lv_obj_center(menu_cont);
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, "Main Menu");
 
-    lv_obj_set_flex_flow(
-        menu_cont,
-        LV_FLEX_FLOW_COLUMN);
-
-    lv_obj_set_flex_align(
-        menu_cont,
-        LV_FLEX_ALIGN_START,
-        LV_FLEX_ALIGN_CENTER,
-        LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_set_scroll_snap_y(
-        menu_cont,
-        LV_SCROLL_SNAP_CENTER);
-
-    lv_obj_set_style_pad_top(menu_cont, 140, 0);
-    lv_obj_set_style_pad_bottom(menu_cont, 140, 0);
-    lv_obj_set_style_pad_row(menu_cont, 20, 0);
-
-    lv_obj_t *label1 =
-        lv_label_create(menu_cont);
-
-    lv_label_set_text(
-        label1,
-        "Main Menu");
-
-    lv_obj_t *btn1 =
-        lv_button_create(menu_cont);
-
-    lv_obj_set_size(
-        btn1,
-        200,
-        50);
-
-    lv_obj_t *btn_lbl =
-        lv_label_create(btn1);
-
-    lv_label_set_text(
-        btn_lbl,
-        "Open Settings");
-
-    lv_obj_center(btn_lbl);
-
-    /*
-     * This is what makes touching the button
-     * open the second menu.
-     */
-    lv_obj_add_event_cb(
-        btn1,
-        open_second_menu_cb,
-        LV_EVENT_CLICKED,
-        NULL);
+    create_menu_button(menu_cont, "Settings", open_settings_cb);
+    create_menu_button(menu_cont, "Hardware Tests", open_hardware_tests_cb);
+    create_menu_button(menu_cont, "About", open_about_cb);
 }
 
-static void create_second_menu(void)
+static void create_settings_menu(void)
 {
-    menu_cont = lv_obj_create(lv_screen_active());
+    menu_cont = create_menu_container();
 
-    lv_obj_set_size(menu_cont, 360, 360);
-    lv_obj_center(menu_cont);
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, "Settings");
 
-    lv_obj_set_flex_flow(
-        menu_cont,
-        LV_FLEX_FLOW_COLUMN);
+    create_menu_button(menu_cont, "Display", open_display_cb);
+    create_menu_button(menu_cont, "Audio", open_audio_cb);
+    create_menu_button(menu_cont, "Input", open_input_cb);
+    create_menu_button(menu_cont, "Back", back_cb);
+}
 
-    lv_obj_set_flex_align(
-        menu_cont,
-        LV_FLEX_ALIGN_START,
-        LV_FLEX_ALIGN_CENTER,
-        LV_FLEX_ALIGN_CENTER);
+static void create_display_menu(void)
+{
+    menu_cont = create_menu_container();
 
-    lv_obj_set_scroll_snap_y(
-        menu_cont,
-        LV_SCROLL_SNAP_CENTER);
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, "Display");
 
-    lv_obj_set_style_pad_top(menu_cont, 140, 0);
-    lv_obj_set_style_pad_bottom(menu_cont, 140, 0);
-    lv_obj_set_style_pad_row(menu_cont, 20, 0);
+    lv_obj_t *brightness_label = lv_label_create(menu_cont);
+    lv_label_set_text(brightness_label, "Brightness");
+
+    lv_obj_t *brightness = lv_slider_create(menu_cont);
+    lv_obj_set_size(brightness, 200, 20);
+    lv_slider_set_range(brightness, 0, 100);
+    lv_slider_set_value(brightness, 75, LV_ANIM_OFF);
+
+    create_menu_button(menu_cont, "Back", back_cb);
+}
+
+static void create_audio_menu(void)
+{
+    menu_cont = create_menu_container();
+
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, "Audio");
+
+    lv_obj_t *volume_label = lv_label_create(menu_cont);
+    lv_label_set_text(volume_label, "Volume");
+
+    lv_obj_t *volume = lv_slider_create(menu_cont);
+    lv_obj_set_size(volume, 200, 20);
+    lv_slider_set_range(volume, 0, 100);
+    lv_slider_set_value(volume, 50, LV_ANIM_OFF);
+
+    create_menu_button(menu_cont, "Back", back_cb);
+}
+
+static void bezel_sensitivity_changed_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target_obj(e);
+    encoder_scroll_per_step = lv_slider_get_value(slider);
+}
+
+static void create_input_menu(void)
+{
+    menu_cont = create_menu_container();
+
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, "Input");
+
+    lv_obj_t *label = lv_label_create(menu_cont);
+    lv_label_set_text(label, "Bezel Sensitivity");
+
+    lv_obj_t *slider = lv_slider_create(menu_cont);
+    lv_obj_set_size(slider, 200, 20);
+    lv_slider_set_range(slider, 5, 80);
+    lv_slider_set_value(
+        slider,
+        encoder_scroll_per_step,
+        LV_ANIM_OFF);
+
+    lv_obj_add_event_cb(
+        slider,
+        bezel_sensitivity_changed_cb,
+        LV_EVENT_VALUE_CHANGED,
+        NULL);
+
+    create_menu_button(menu_cont, "Back", back_cb);
+}
+
+static void create_hardware_tests_menu(void)
+{
+    menu_cont = create_menu_container();
+
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, "Hardware Tests");
+
+    create_menu_button(menu_cont, "LCD / Colors", open_hw_display_cb);
+    create_menu_button(menu_cont, "Touch", open_hw_touch_cb);
+    create_menu_button(menu_cont, "Bezel Encoder", open_hw_encoder_cb);
+    create_menu_button(menu_cont, "Backlight", open_hw_backlight_cb);
+    create_menu_button(menu_cont, "RAM / PSRAM", open_hw_memory_cb);
+
+    create_menu_button(menu_cont, "TF / microSD", open_hw_sd_cb);
+    create_menu_button(menu_cont, "Haptic Motor", open_hw_haptics_cb);
+    create_menu_button(menu_cont, "Audio + MIC", open_hw_audio_mic_cb);
+    create_menu_button(menu_cont, "Battery / ADC", open_hw_battery_cb);
+    create_menu_button(menu_cont, "Wireless / ESP32", open_hw_wireless_cb);
+
+    create_menu_button(menu_cont, "Back", back_cb);
+}
+static void haptic_strong_click_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(drv2605_play_effect(1));
+}
+static void haptic_double_click_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(drv2605_play_effect(10));
+}
+static void haptic_soft_bump_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(drv2605_play_effect(7));
+}
+static void haptic_buzz_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(drv2605_play_effect(47));
+}
+static void haptic_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(drv2605_stop());
+}
+
+static lv_obj_t *create_color_swatch(lv_obj_t *parent, const char *name, uint32_t color)
+{
+    lv_obj_t *swatch = lv_obj_create(parent);
+    lv_obj_set_size(swatch, 200, 52);
+    lv_obj_set_style_bg_color(swatch, lv_color_hex(color), 0);
+    lv_obj_set_style_bg_opa(swatch, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(swatch, 0, 0);
+    lv_obj_set_style_radius(swatch, 8, 0);
+
+    lv_obj_t *label = lv_label_create(swatch);
+    lv_label_set_text(label, name);
+
+    if (color == 0xFFFFFF || color == 0xFFFF00 || color == 0x00FF00)
+        lv_obj_set_style_text_color(label, lv_color_hex(0x000000), 0);
+    else
+        lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+
+    lv_obj_center(label);
+    return swatch;
+}
+
+static void create_hw_display_test_menu(void)
+{
+    menu_cont = create_menu_container();
+
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, "LCD Color Test");
+
+    create_color_swatch(menu_cont, "RED", 0xFF0000);
+    create_color_swatch(menu_cont, "GREEN", 0x00FF00);
+    create_color_swatch(menu_cont, "BLUE", 0x0000FF);
+    create_color_swatch(menu_cont, "WHITE", 0xFFFFFF);
+    create_color_swatch(menu_cont, "BLACK", 0x000000);
+    create_color_swatch(menu_cont, "YELLOW", 0xFFFF00);
+    create_color_swatch(menu_cont, "MAGENTA", 0xFF00FF);
+    create_color_swatch(menu_cont, "CYAN", 0x00FFFF);
+
+    lv_obj_t *hint = lv_label_create(menu_cont);
+    lv_label_set_text(hint, "Look for bad colors,\nlines, flicker, or dead areas.");
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+
+    create_menu_button(menu_cont, "Back", back_cb);
+}
+
+static void create_hw_touch_test_menu(void)
+{
+    menu_cont = create_menu_container();
+
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, "Touch Test");
+
+    lv_obj_t *hint = lv_label_create(menu_cont);
+    lv_label_set_text(hint, "Touch around the screen.\nCoordinates update below.");
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+
+    touch_test_label = lv_label_create(menu_cont);
+    lv_label_set_text(touch_test_label, "X: ---   Y: ---\nReleased");
+    lv_obj_set_style_text_align(touch_test_label, LV_TEXT_ALIGN_CENTER, 0);
+
+    create_menu_button(menu_cont, "Back", back_cb);
+}
+
+static void create_hw_encoder_test_menu(void)
+{
+    menu_cont = create_menu_container();
+
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, "Bezel Encoder Test");
+
+    lv_obj_t *hint = lv_label_create(menu_cont);
+    lv_label_set_text(hint, "Rotate the bezel.\nRaw steps are counted below.");
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+
+    encoder_test_label = lv_label_create(menu_cont);
+    lv_label_set_text_fmt(encoder_test_label, "Count: %ld", (long)encoder_test_count);
+
+    create_menu_button(menu_cont, "Back", back_cb);
+}
+
+static void backlight_test_changed_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target_obj(e);
+    int32_t value = lv_slider_get_value(slider);
+
+    if (value < 0)
+        value = 0;
+    if (value > 255)
+        value = 255;
+
+    backlight_test_level = (uint8_t)value;
+    setUpduty(backlight_test_level);
+}
+
+static void create_hw_backlight_test_menu(void)
+{
+    menu_cont = create_menu_container();
+
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, "Backlight Test");
+
+    lv_obj_t *slider = lv_slider_create(menu_cont);
+    lv_obj_set_size(slider, 200, 24);
+    lv_slider_set_range(slider, 0, 255);
+    lv_slider_set_value(slider, backlight_test_level, LV_ANIM_OFF);
+    lv_obj_add_event_cb(slider, backlight_test_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    create_menu_button(menu_cont, "Back", back_cb);
+}
+
+static void create_hw_memory_test_menu(void)
+{
+    menu_cont = create_menu_container();
+
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, "RAM / PSRAM Test");
+
+    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+
+    lv_obj_t *info = lv_label_create(menu_cont);
+    lv_label_set_text_fmt(
+        info,
+        "Internal free: %u KiB\n"
+        "Largest block: %u KiB\n\n"
+        "PSRAM free: %u KiB\n"
+        "Largest block: %u KiB",
+        (unsigned)(internal_free / 1024),
+        (unsigned)(internal_largest / 1024),
+        (unsigned)(psram_free / 1024),
+        (unsigned)(psram_largest / 1024));
+
+    lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *status = lv_label_create(menu_cont);
+    lv_label_set_text(status, psram_free > 0 ? "PSRAM: detected" : "PSRAM: NOT detected");
+
+    create_menu_button(menu_cont, "Back", back_cb);
+}
+static void create_hw_haptics_test_menu(void)
+{
+    menu_cont = create_menu_container();
 
     lv_obj_t *title =
         lv_label_create(menu_cont);
 
     lv_label_set_text(
         title,
-        "Settings");
+        "Haptic Motor Test");
 
-    lv_obj_t *brightness =
-        lv_slider_create(menu_cont);
-
-    lv_obj_set_size(
-        brightness,
-        200,
-        20);
-
-    lv_slider_set_range(
-        brightness,
-        0,
-        100);
-
-    lv_slider_set_value(
-        brightness,
-        75,
-        LV_ANIM_OFF);
-
-    lv_obj_t *volume =
-        lv_arc_create(menu_cont);
-
-    lv_obj_set_size(
-        volume,
-        150,
-        150);
-
-    lv_arc_set_range(
-        volume,
-        0,
-        100);
-
-    lv_arc_set_value(
-        volume,
-        50);
-
-    lv_obj_t *back_btn =
-        lv_button_create(menu_cont);
-
-    lv_obj_set_size(
-        back_btn,
-        200,
-        50);
-
-    lv_obj_t *back_label =
-        lv_label_create(back_btn);
+    lv_obj_t *info =
+        lv_label_create(menu_cont);
 
     lv_label_set_text(
-        back_label,
-        "Back");
+        info,
+        "Select a DRV2605\n"
+        "built-in effect");
 
-    lv_obj_center(back_label);
+    lv_obj_set_style_text_align(
+        info,
+        LV_TEXT_ALIGN_CENTER,
+        0);
 
-    lv_obj_add_event_cb(
-        back_btn,
-        back_to_main_menu_cb,
-        LV_EVENT_CLICKED,
-        NULL);
+    create_menu_button(
+        menu_cont,
+        "Direct RTP Test",
+        haptic_rtp_test_cb);
+
+    create_menu_button(
+        menu_cont,
+        "Strong Click",
+        haptic_strong_click_cb);
+
+    create_menu_button(
+        menu_cont,
+        "Double Click",
+        haptic_double_click_cb);
+
+    create_menu_button(
+        menu_cont,
+        "Soft Bump",
+        haptic_soft_bump_cb);
+
+    create_menu_button(
+        menu_cont,
+        "Buzz",
+        haptic_buzz_cb);
+
+    create_menu_button(
+        menu_cont,
+        "Stop",
+        haptic_stop_cb);
+
+    create_menu_button(
+        menu_cont,
+        "Back",
+        back_cb);
 }
 
-static void back_to_main_menu_cb(lv_event_t *e)
+static void create_hw_unavailable_menu(void)
 {
-    if (menu_cont != NULL)
-    {
-        lv_obj_delete(menu_cont);
-        menu_cont = NULL;
-    }
+    menu_cont = create_menu_container();
 
-    create_main_menu();
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, unavailable_hw_name);
+
+    lv_obj_t *status = lv_label_create(menu_cont);
+    lv_label_set_text(
+        status,
+        "Hardware is present,\n"
+        "but its driver is not yet\n"
+        "integrated in this project.");
+    lv_obj_set_style_text_align(status, LV_TEXT_ALIGN_CENTER, 0);
+
+    create_menu_button(menu_cont, "Back", back_cb);
 }
+
+static void create_about_menu(void)
+{
+    menu_cont = create_menu_container();
+
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, "About");
+
+    lv_obj_t *info = lv_label_create(menu_cont);
+    lv_label_set_text(
+        info,
+        "Waveshare ESP32-S3\nKnob Touch LCD 1.8\nLVGL 9");
+
+    lv_obj_set_style_text_align(
+        info,
+        LV_TEXT_ALIGN_CENTER,
+        0);
+
+    create_menu_button(menu_cont, "Back", back_cb);
+}
+
+/* ============================================================================
+ * 6. LVGL DISPLAY AND TOUCH BRIDGE
+ * ========================================================================== */
 
 static bool notify_lvgl_flush_ready(
     esp_lcd_panel_io_handle_t panel_io,
@@ -429,7 +1533,12 @@ static void lvgl_flush_cb(
 
     uint16_t *pixels = (uint16_t *)px_map;
 
-    // SH8601 expects opposite RGB565 byte order
+    /*
+     * Swap the two bytes of every RGB565 pixel before QSPI transfer.
+     *
+     * LVGL's RGB565 memory byte order differs from the order expected by this
+     * SH8601 transfer path. Without this swap, colors appear incorrect.
+     */
     for (uint32_t i = 0; i < pixel_count; i++)
     {
         pixels[i] =
@@ -489,10 +1598,24 @@ static void lvgl_touch_cb(
             data->point.y = LCD_V_RES - 1;
 
         data->state = LV_INDEV_STATE_PRESSED;
+
+        if (current_menu == MENU_HW_TOUCH && touch_test_label != NULL)
+        {
+            lv_label_set_text_fmt(
+                touch_test_label,
+                "X: %ld   Y: %ld\nPressed",
+                (long)data->point.x,
+                (long)data->point.y);
+        }
     }
     else
     {
         data->state = LV_INDEV_STATE_RELEASED;
+
+        if (current_menu == MENU_HW_TOUCH && touch_test_label != NULL)
+        {
+            lv_label_set_text(touch_test_label, "Released");
+        }
     }
 }
 #endif
@@ -542,6 +1665,10 @@ static void lvgl_port_task(void *arg)
     }
 }
 
+/* ============================================================================
+ * 7. FREERTOS TASKS AND PERIODIC INPUT PROCESSING
+ * ========================================================================== */
+
 #ifdef Backlight_Testing
 void backlight_test_task(void *arg)
 {
@@ -588,32 +1715,42 @@ static void user_encoder_loop_task(void *arg)
 
 static void encoder_scroll_timer_cb(lv_timer_t *timer)
 {
+    (void)timer;
+
     if (menu_cont == NULL)
-    {
         return;
-    }
 
     int32_t steps = encoder_steps;
-
     if (steps == 0)
-    {
         return;
-    }
 
     encoder_steps = 0;
 
-    /*
-     * Positive and negative directions may need reversing
-     * depending on how the bezel feels physically.
-     */
-    const int32_t scroll_per_step = 20;
+    if (current_menu == MENU_HW_ENCODER)
+    {
+        encoder_test_count += steps;
+
+        if (encoder_test_label != NULL)
+        {
+            lv_label_set_text_fmt(
+                encoder_test_label,
+                "Count: %ld\nLast step: %s",
+                (long)encoder_test_count,
+                steps > 0 ? "+" : "-");
+        }
+        return;
+    }
 
     lv_obj_scroll_by_bounded(
         menu_cont,
         0,
-        -steps * scroll_per_step,
+        -steps * encoder_scroll_per_step,
         LV_ANIM_OFF);
 }
+/* ============================================================================
+ * 8. APPLICATION ENTRY POINT / HARDWARE INITIALIZATION
+ * ========================================================================== */
+
 void app_main(void)
 {
 
@@ -673,6 +1810,9 @@ void app_main(void)
 
     ESP_LOGI(TAG, "STEP 7: I2C");
     i2c_master_Init(); // I2C_Init
+
+    ESP_LOGI(TAG, "Initialize haptic motor");
+    ESP_ERROR_CHECK(drv2605_init());
 
 #if USE_TOUCH
     lcd_touch_init();
@@ -791,10 +1931,6 @@ void app_main(void)
         2,
         NULL);
 
-    lv_timer_create(
-        encoder_scroll_timer_cb,
-        5,
-        NULL);
     // draw items here
 
     ESP_LOGI(TAG, "Display UI");
