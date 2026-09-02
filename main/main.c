@@ -2,55 +2,160 @@
  * Waveshare ESP32-S3-Knob-Touch-LCD-1.8
  * LVGL 9 application + hardware diagnostics
  *
- * Major sections:
- *   1. Includes and global state
- *   2. LCD initialization data
+ * PURPOSE
+ * -------
+ * This file is the top-level application for the ESP32-S3 side of the knob.
+ * It brings up the display and touch controller, runs the LVGL user interface,
+ * reads the rotary bezel, exposes BLE HID media controls, and provides
+ * non-destructive hardware diagnostic pages for the major onboard peripherals.
+ *
+ * HOW TO READ THIS FILE
+ * ---------------------
+ * The program is arranged by subsystem rather than by call order. Hardware
+ * drivers and diagnostic workers appear first, the menu/UI layer follows, and
+ * app_main() at the bottom wires everything together.
+ *
+ * A useful mental model is:
+ *
+ *      hardware interrupt / driver
+ *                 |
+ *                 v
+ *        FreeRTOS worker task
+ *                 |
+ *        small scalar state only
+ *                 |
+ *                 v
+ *          LVGL timer/callback
+ *                 |
+ *                 v
+ *             screen UI
+ *
+ * The important rule is that background tasks should NOT manipulate LVGL
+ * objects directly. LVGL is not generally thread-safe. Workers publish simple
+ * state such as counters, error codes, RMS values, and connection flags; LVGL
+ * timers render that state while running in the UI context.
+ *
+ * CONCURRENCY / OWNERSHIP
+ * -----------------------
+ * - LVGL task:
+ *     Owns normal UI drawing and LVGL timer callbacks.
+ *
+ * - Encoder task:
+ *     Waits on the BSP encoder event group and accumulates signed steps.
+ *     A fast LVGL timer consumes those steps for scrolling or media volume.
+ *
+ * - Microphone task:
+ *     Owns I2S0 while PDM capture is active. It converts PDM to 16-bit PCM,
+ *     computes DC-corrected RMS level, and publishes diagnostic values.
+ *
+ * - DAC tone task:
+ *     Owns I2S1 while the PCM5100A test tone is active.
+ *
+ * - Battery task:
+ *     Performs ADC conversion outside the LVGL event path so a slow ADC read
+ *     cannot freeze touch, rendering, or menu navigation.
+ *
+ * - BLE HID module:
+ *     Lives mostly in media_controller_ble.c. This file sends logical media
+ *     commands and polls connection state from an LVGL timer.
+ *
+ * AUDIO PIN OWNERSHIP
+ * -------------------
+ * The official Waveshare 07_Audio_Test proves that MIC and DAC use separate
+ * GPIOs and are intentionally able to run at the same time:
+ *
+ *      microphone PDM clock : GPIO45
+ *      microphone PDM data  : GPIO46
+ *
+ *      PCM5100A BCLK         : GPIO39
+ *      PCM5100A WS / LRCK    : GPIO40
+ *      PCM5100A DATA         : GPIO41
+ *      PCM5100A S3 control   : GPIO0 HIGH
+ *
+ * This separation is what makes Waveshare's microphone-to-DAC loopback mode
+ * possible. Earlier experimental builds incorrectly treated GPIO45 as DAC DATA.
+ *
+ * HARDWARE-DIAGNOSTIC PHILOSOPHY
+ * ------------------------------
+ * Diagnostics are intentionally conservative:
+ *
+ * - microSD is mounted lazily and is never auto-formatted.
+ * - the SD write test creates, verifies, then removes one dedicated file.
+ * - BLE failure does not prevent the local UI from booting.
+ * - ADC sampling runs in its own worker task.
+ * - audio workers stop and release their I2S channels when leaving the page.
+ * - optional diagnostics log failures instead of rebooting the entire device
+ *   whenever possible.
+ *
+ * MAJOR SECTIONS
+ * --------------
+ *   1. Global application state and board resource ownership
+ *   2. SH8601 display initialization data
  *   3. Menu/navigation declarations
  *   4. DRV2605 haptic driver
  *   5. SDMMC / microSD driver
- *   6. Microphone / audio diagnostics
- *   7. Battery / system-voltage ADC diagnostics
- *   8. BLE media-controller integration
- *   9. Menu implementation
+ *   6. PDM microphone + PCM5100A audio diagnostics
+ *   7. Battery / system-voltage ADC diagnostic
+ *   8. BLE media-controller bridge
+ *   9. Menu and diagnostic-page construction
  *  10. LVGL display/touch bridge
- *  11. FreeRTOS tasks
+ *  11. FreeRTOS input tasks and periodic processing
  *  12. app_main hardware initialization
+ *
+ * NOTE ABOUT THIS ORGANIZED VERSION
+ * ---------------------------------
+ * This pass intentionally changes comments/organization only. Executable
+ * statements, constants, control flow, and hardware behavior are preserved so
+ * the file remains equivalent to the supplied working source.
  * ========================================================================== */
 
+/* Standard C library ------------------------------------------------------- */
 #include <stdio.h>
-#include <string.h>
-#include <errno.h>
-#include <dirent.h>
+#include <stdint.h> /* int16_t plus INT16_MIN / INT16_MAX for loopback clamp */ /* FILE, fopen(), printf(), stdout */
+#include <string.h>                                                             /* strlen(), strcmp(), memset() */
+#include <errno.h>                                                              /* errno values used by FatFs/POSIX file diagnostics */
+#include <dirent.h>                                                             /* opendir()/readdir() for SD root-directory listing */
 
+/* FreeRTOS ---------------------------------------------------------------- */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/gpio.h"
-#include "driver/i2c_master.h"
-#include "driver/spi_master.h"
-#include "driver/sdmmc_host.h"
-#include "driver/i2s_pdm.h"
-#include "driver/i2s_std.h"
+
+/* ESP-IDF peripheral drivers --------------------------------------------- */
+#include "driver/gpio.h"       /* GPIO configuration and DAC mux select */
+#include "driver/i2c_master.h" /* shared I2C bus used by board BSP devices */
+#include "driver/spi_master.h" /* QSPI LCD transport */
+#include "driver/sdmmc_host.h" /* native 4-bit SD/MMC host */
+#include "driver/i2s_pdm.h"    /* PDM microphone receive mode */
+#include "driver/i2s_std.h"    /* standard I2S PCM5100A transmit mode */
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
-#include "esp_timer.h"
+
+/* ESP-IDF services / display / storage ---------------------------------- */
+#include "esp_timer.h" /* LVGL millisecond tick source */
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_err.h"
 #include "esp_check.h"
 #include "esp_log.h"
-#include "esp_heap_caps.h"
-#include "esp_vfs_fat.h"
-#include "sdmmc_cmd.h"
+#include "esp_heap_caps.h" /* DMA-capable LVGL draw buffers */
+#include "esp_vfs_fat.h"   /* FatFs VFS mount helper */
+#include "sdmmc_cmd.h"     /* SD card identification/info */
+
+/* GUI -------------------------------------------------------------------- */
 #include "lvgl.h"
 #include "lv_demos.h"
+
+/* Waveshare / project BSP components ------------------------------------ */
 #include "esp_lcd_sh8601.h"
 #include "i2c_bsp.h"
 #include "lcd_touch_bsp.h"
 #include "user_config.h"
 #include "lcd_bl_pwm_bsp.h"
 #include "user_encoder_bsp.h"
+
+/* Project-local BLE HID abstraction ------------------------------------- */
 #include "media_controller_ble.h"
 
 /* ============================================================================
@@ -113,7 +218,6 @@ static sdmmc_card_t *sd_card = NULL;
 static bool sd_card_mounted = false;
 static lv_obj_t *sd_test_label = NULL;
 
-
 /*
  * Battery / system-voltage ADC diagnostic.
  *
@@ -133,13 +237,13 @@ static lv_obj_t *sd_test_label = NULL;
  * range. The UI therefore only shows a rough battery percentage when the rail
  * is inside a plausible battery-only window.
  */
-#define BATTERY_ADC_UNIT             ADC_UNIT_1
-#define BATTERY_ADC_CHANNEL          ADC_CHANNEL_0
-#define BATTERY_ADC_ATTEN            ADC_ATTEN_DB_12
-#define BATTERY_ADC_BITWIDTH         ADC_BITWIDTH_12
-#define BATTERY_ADC_MULTISAMPLES     8
-#define BATTERY_DIVIDER_NUMERATOR    2
-#define BATTERY_DIVIDER_DENOMINATOR  1
+#define BATTERY_ADC_UNIT ADC_UNIT_1
+#define BATTERY_ADC_CHANNEL ADC_CHANNEL_0
+#define BATTERY_ADC_ATTEN ADC_ATTEN_DB_12
+#define BATTERY_ADC_BITWIDTH ADC_BITWIDTH_12
+#define BATTERY_ADC_MULTISAMPLES 8
+#define BATTERY_DIVIDER_NUMERATOR 2
+#define BATTERY_DIVIDER_DENOMINATOR 1
 
 static adc_oneshot_unit_handle_t battery_adc_handle = NULL;
 static adc_cali_handle_t battery_adc_cali_handle = NULL;
@@ -154,12 +258,12 @@ static lv_obj_t *battery_adc_level_bar = NULL;
  * IMPORTANT:
  * ADC reads do not run from LVGL callbacks.
  *
- * v10 performed initialization + multisampling synchronously while the
- * Battery / ADC page was being constructed from an LV_EVENT_PRESSED callback.
- * That can stall the GUI task if an ADC operation takes longer than expected.
+ * ADC reads intentionally do not run inside LVGL button/timer callbacks.
  *
- * v11 moves all ADC hardware access into this low-priority worker. LVGL only
- * copies the latest scalar results into labels and the bar.
+ * A multisample ADC conversion can take long enough to make the interface feel
+ * frozen if it executes synchronously while a page is being constructed.
+ * Instead, a low-priority worker owns ADC hardware access and publishes only
+ * the latest scalar result. LVGL copies those values into labels and the bar.
  */
 typedef enum
 {
@@ -180,7 +284,6 @@ static volatile esp_err_t battery_latest_error = ESP_OK;
 
 static TaskHandle_t battery_adc_task_handle = NULL;
 
-
 /*
  * ESP32-S3 microphone diagnostic state.
  *
@@ -200,10 +303,10 @@ static TaskHandle_t battery_adc_task_handle = NULL;
  * used by Waveshare's official 07_Audio_Test, which initializes PDM RX for the
  * microphone.
  */
-#define MIC_PDM_CLK_PIN      GPIO_NUM_45
-#define MIC_PDM_DATA_PIN     GPIO_NUM_46
-#define MIC_SAMPLE_RATE_HZ   16000
-#define MIC_TASK_STACK_SIZE  4096
+#define MIC_PDM_CLK_PIN GPIO_NUM_45
+#define MIC_PDM_DATA_PIN GPIO_NUM_46
+#define MIC_SAMPLE_RATE_HZ 16000
+#define MIC_TASK_STACK_SIZE 4096
 
 typedef enum
 {
@@ -250,33 +353,40 @@ static lv_obj_t *audio_dac_info_label = NULL;
 /*
  * PCM5100A / 3.5 mm output diagnostic.
  *
- * The board schematic confirms that the ESP32-S3 has its own audio route into
- * the PCM5100A through the CH445P 4-channel analog switch:
+ * These values come directly from the official Waveshare ESP-IDF
+ * 07_Audio_Test supplied by the user:
  *
- *      S3 BCLK       GPIO39
- *      S3 LRCK / WS  GPIO44
- *      S3 DATA       GPIO45
- *      CH445P IN     GPIO40
+ *      PCM5100A BCLK      -> ESP32-S3 GPIO39
+ *      PCM5100A WS/LRCK   -> ESP32-S3 GPIO40
+ *      PCM5100A DATA      -> ESP32-S3 GPIO41
+ *      audio control      -> ESP32-S3 GPIO0, driven HIGH
+ *      MCLK/SCK           -> not generated by ESP32-S3
  *
- * The S3 signals are wired to the CH445P S2 inputs. The CH445P datasheet says
- * IN=HIGH selects S2, so GPIO40 must be HIGH while the S3 is driving the DAC.
+ * Factory TX configuration:
  *
- * GPIO45 is shared with the microphone PDM clock. The tone task therefore waits
- * for the microphone task to fully stop and release its I2S channel before
- * configuring standard-I2S TX.
+ *      I2S controller     -> I2S1
+ *      role               -> MASTER
+ *      sample rate        -> 44.1 kHz
+ *      sample width       -> 16 bit
+ *      serial format      -> MSB / left-justified
+ *      loopback channels  -> MONO
+ *
+ * The factory demo separately uses I2S0 for the PDM microphone on GPIO45/46.
+ * Therefore the MIC meter and DAC tone may run simultaneously.
  */
-#define DAC_I2S_BCLK_PIN       GPIO_NUM_39
-#define DAC_I2S_WS_PIN         GPIO_NUM_44
-#define DAC_I2S_DATA_PIN       GPIO_NUM_45
-#define DAC_I2S_SWITCH_PIN     GPIO_NUM_40
-#define DAC_SAMPLE_RATE_HZ     32000
-#define DAC_TONE_HZ            1000
-#define DAC_TONE_TASK_STACK    4096
+#define DAC_I2S_BCLK_PIN GPIO_NUM_39
+#define DAC_I2S_WS_PIN GPIO_NUM_40
+#define DAC_I2S_DATA_PIN GPIO_NUM_41
+#define DAC_CONTROL_PIN GPIO_NUM_0
+
+#define DAC_SAMPLE_RATE_HZ 44100
+#define DAC_TONE_HZ 1000
+#define DAC_TONE_TASK_STACK 4096
 
 typedef enum
 {
     DAC_TEST_STOPPED = 0,
-    DAC_TEST_WAITING_FOR_MIC,
+    DAC_TEST_WAITING_FOR_MIC, /* legacy enum value; no longer used */
     DAC_TEST_STARTING,
     DAC_TEST_RUNNING,
     DAC_TEST_STOPPING,
@@ -288,6 +398,139 @@ static TaskHandle_t dac_tone_task_handle = NULL;
 static volatile bool dac_tone_stop_requested = false;
 static volatile dac_test_state_t dac_test_state = DAC_TEST_STOPPED;
 static volatile esp_err_t dac_last_error = ESP_OK;
+
+static volatile uint32_t dac_blocks_written = 0;
+static volatile int dac_control_readback = -1;
+
+/*
+ * REAL-TIME MICROPHONE -> PCM5100A LOOPBACK
+ * ----------------------------------------
+ *
+ * This diagnostic is based directly on Waveshare's official
+ * `i2s_adc_dac_loop_task()` from 07_Audio_Test:
+ *
+ *      I2S0 PDM RX  -> read microphone PCM samples
+ *      I2S1 STD TX  -> write those samples to PCM5100A
+ *
+ * The official example simply copies each 2048-byte microphone block straight
+ * into the DAC writer. This project keeps the same hardware architecture and
+ * transport format, but adds several safety/diagnostic improvements:
+ *
+ *   1. The worker owns BOTH I2S channels for its entire lifetime.
+ *      The standalone MIC meter and standalone 1 kHz tone are stopped first so
+ *      two tasks can never configure the same I2S controller simultaneously.
+ *
+ *   2. The measured microphone DC offset is removed before playback.
+ *      Our microphone has already demonstrated a significant DC component.
+ *      Removing it preserves output headroom for actual sound instead of
+ *      wasting DAC range on an inaudible constant offset.
+ *
+ *   3. Playback gain is adjustable from 0% to 200%.
+ *      v19 defaults to 50% because the verified v18 loopback showed a healthy
+ *      microphone signal but 10% playback attenuation was unnecessarily quiet.
+ *      The upper half of the range intentionally permits amplification for
+ *      diagnostic use; every output sample is saturated safely to int16_t and
+ *      the UI reports how many samples clipped in the most recent block.
+ *
+ *      Headphones are still the safest first test because microphone -> speaker
+ *      loopback can create acoustic feedback very quickly.
+ *
+ *   4. No heap allocation occurs inside the audio loop.
+ *      Waveshare's bsp_i2s_write() allocates a temporary buffer on every write.
+ *      Here both RX and TX buffers live on the worker's stack for the lifetime
+ *      of the task, avoiding continuous malloc/free churn.
+ *
+ *   5. The loopback worker also publishes DC-corrected RMS level and block
+ *      counters so the existing LVGL page can prove data is flowing even if the
+ *      acoustic output is quiet.
+ */
+#define LOOPBACK_SAMPLE_RATE_HZ 44100
+#define LOOPBACK_BUFFER_BYTES 2048
+
+/*
+ * Loopback gain limits.
+ *
+ * 100% = unity gain: a centered microphone sample is sent to the DAC unchanged.
+ *  50% = half amplitude, the new conservative default.
+ * 200% = 2x amplitude. Samples that would exceed signed 16-bit range are
+ *        saturated rather than allowed to wrap around.
+ */
+#define LOOPBACK_GAIN_MIN_PERCENT 0
+#define LOOPBACK_GAIN_MAX_PERCENT 200
+#define LOOPBACK_GAIN_DEFAULT_PERCENT 50
+
+#define LOOPBACK_TASK_STACK_SIZE 8192
+
+typedef enum
+{
+    LOOPBACK_TEST_STOPPED = 0,
+    LOOPBACK_TEST_WAITING_FOR_OTHER_AUDIO,
+    LOOPBACK_TEST_STARTING,
+    LOOPBACK_TEST_RUNNING,
+    LOOPBACK_TEST_STOPPING,
+    LOOPBACK_TEST_ERROR
+} loopback_test_state_t;
+
+static i2s_chan_handle_t loopback_rx_chan = NULL;
+static i2s_chan_handle_t loopback_tx_chan = NULL;
+static TaskHandle_t loopback_task_handle = NULL;
+
+static volatile bool loopback_stop_requested = false;
+static volatile loopback_test_state_t loopback_test_state =
+    LOOPBACK_TEST_STOPPED;
+static volatile esp_err_t loopback_last_error = ESP_OK;
+
+static volatile uint32_t loopback_blocks = 0;
+
+/*
+ * Pre-gain microphone RMS after DC removal.
+ * This tells us how much real acoustic signal entered the loopback worker.
+ */
+static volatile uint32_t loopback_rms = 0;
+
+/*
+ * Post-gain RMS of the actual samples delivered to I2S1/PCM5100A.
+ * This drops to zero while muted and rises/falls with the gain slider.
+ */
+static volatile uint32_t loopback_output_rms = 0;
+
+static volatile int32_t loopback_dc = 0;
+static volatile int loopback_level_percent = 0;
+static volatile int loopback_control_readback = -1;
+
+/*
+ * Live playback controls.
+ *
+ * LVGL changes these small scalar values from the UI task. The audio worker
+ * snapshots both values once at the beginning of each PCM block, so one block
+ * is always processed with one internally-consistent gain/mute setting.
+ */
+static volatile int loopback_gain_percent = LOOPBACK_GAIN_DEFAULT_PERCENT;
+static volatile bool loopback_muted = false;
+
+/*
+ * Number of output samples that saturated at INT16_MIN/MAX in the most recent
+ * block. A non-zero value is a useful warning that high gain is clipping.
+ */
+static volatile uint32_t loopback_clipped_samples = 0;
+
+/*
+ * Separate status line for the real-time loopback worker.
+ *
+ * Like every page-specific LVGL pointer in this file, this pointer is valid only
+ * while MENU_HW_AUDIO_MIC is visible. show_menu() explicitly sets it to NULL
+ * before deleting the old menu container.
+ */
+static lv_obj_t *audio_loopback_status_label = NULL;
+
+/*
+ * Loopback gain UI objects.
+ *
+ * These pointers are page-local just like audio_loopback_status_label. They are
+ * cleared before the Audio page container is deleted.
+ */
+static lv_obj_t *audio_loopback_gain_label = NULL;
+static lv_obj_t *audio_loopback_gain_slider = NULL;
 
 /*
  * Media-controller page state. Bluetooth callbacks never update LVGL directly;
@@ -539,13 +782,26 @@ static menu_id_t menu_stack[MENU_STACK_SIZE];
 /* -1 means the navigation history is empty. */
 static int menu_stack_top = -1;
 
+/* --------------------------------------------------------------------------
+ * 9.1 Common menu primitives
+ * -------------------------------------------------------------------------- */
 static lv_obj_t *create_menu_container(void);
 static lv_obj_t *create_menu_button(lv_obj_t *parent, const char *text, lv_event_cb_t callback);
 
+/* --------------------------------------------------------------------------
+ * 9.2 Navigation router and history
+ * -------------------------------------------------------------------------- */
 static void show_menu(menu_id_t menu);
 static void push_menu(menu_id_t menu);
 static void pop_menu(void);
 
+/* --------------------------------------------------------------------------
+ * 9.4 Page constructors
+ *
+ * Each create_* function builds one complete page under menu_cont. show_menu()
+ * deletes the old container before calling the selected constructor, so page-
+ * specific LVGL object pointers must be treated as temporary.
+ * -------------------------------------------------------------------------- */
 static void create_main_menu(void);
 static void create_media_controller_menu(void);
 static void create_settings_menu(void);
@@ -573,6 +829,13 @@ static void media_next_cb(lv_event_t *e);
 static void media_mute_cb(lv_event_t *e);
 static void media_status_timer_cb(lv_timer_t *timer);
 
+/* --------------------------------------------------------------------------
+ * 9.3 Navigation callbacks
+ *
+ * These are intentionally tiny adapters from LVGL event signatures to the
+ * menu-stack API. Keeping navigation policy in push_menu()/pop_menu() avoids
+ * duplicating history logic in every button.
+ * -------------------------------------------------------------------------- */
 static void open_settings_cb(lv_event_t *e);
 static void open_display_cb(lv_event_t *e);
 static void open_audio_cb(lv_event_t *e);
@@ -602,25 +865,68 @@ static void sd_list_root_cb(lv_event_t *e);
 static void sd_unmount_cb(lv_event_t *e);
 
 /* Audio / microphone diagnostic callbacks and helpers */
+/* --------------------------------------------------------------------------
+ * 6.5 Audio diagnostic UI callbacks
+ * -------------------------------------------------------------------------- */
 static void audio_mic_start_cb(lv_event_t *e);
 static void audio_mic_stop_cb(lv_event_t *e);
 static void audio_dac_start_tone_cb(lv_event_t *e);
 static void audio_dac_stop_tone_cb(lv_event_t *e);
+
+static void audio_loopback_start_cb(lv_event_t *e);
+static void audio_loopback_stop_cb(lv_event_t *e);
+static void audio_loopback_gain_changed_cb(lv_event_t *e);
+static void audio_loopback_toggle_mute_cb(lv_event_t *e);
+
 static void audio_mic_output_info_cb(lv_event_t *e);
 static void audio_mic_back_cb(lv_event_t *e);
 static void audio_mic_ui_timer_cb(lv_timer_t *timer);
 
+/* --------------------------------------------------------------------------
+ * 6.2 PDM microphone worker task
+ * -------------------------------------------------------------------------- */
 static void mic_capture_task(void *arg);
+/* --------------------------------------------------------------------------
+ * 6.3 Microphone lifecycle
+ *
+ * Start/stop are asynchronous. The UI requests a state transition; the worker
+ * owns creation, use, and deletion of the I2S channel.
+ * -------------------------------------------------------------------------- */
 static esp_err_t mic_test_start(void);
 static void mic_test_request_stop(void);
+/* --------------------------------------------------------------------------
+ * 6.1 Microphone signal-processing helpers
+ *
+ * These helpers are deliberately integer-only. The diagnostic does not need
+ * floating-point DSP; it needs a stable, inexpensive indicator of sound level.
+ * -------------------------------------------------------------------------- */
 static uint32_t mic_isqrt_u64(uint64_t value);
 static int mic_level_from_rms(uint32_t rms);
 
+/* --------------------------------------------------------------------------
+ * 6.4 PCM5100A tone-generator worker
+ *
+ * This task performs the blocking I2S writes. LVGL callbacks only request
+ * start/stop, keeping audio transport out of the UI event path.
+ * -------------------------------------------------------------------------- */
 static void dac_tone_task(void *arg);
 static esp_err_t dac_tone_start(void);
 static void dac_tone_request_stop(void);
 
+/* --------------------------------------------------------------------------
+ * 6.5 Real-time microphone -> DAC loopback worker
+ *
+ * This worker owns I2S0 RX and I2S1 TX simultaneously and mirrors the hardware
+ * architecture of Waveshare's official 07_Audio_Test.
+ * -------------------------------------------------------------------------- */
+static void audio_loopback_task(void *arg);
+static esp_err_t audio_loopback_start(void);
+static void audio_loopback_request_stop(void);
+
 /* Battery / ADC diagnostic callbacks and helpers */
+/* --------------------------------------------------------------------------
+ * 7.1 ADC initialization and calibrated conversion
+ * -------------------------------------------------------------------------- */
 static esp_err_t battery_adc_init(void);
 static esp_err_t battery_adc_read(
     int *raw_average,
@@ -628,6 +934,12 @@ static esp_err_t battery_adc_read(
     int *system_mv,
     bool *used_calibration);
 static int battery_percent_from_mv(int system_mv);
+/* --------------------------------------------------------------------------
+ * 7.2 Background ADC worker
+ *
+ * The worker isolates ADC hardware latency from LVGL. This design was adopted
+ * after synchronous ADC work in a button callback could stall the interface.
+ * -------------------------------------------------------------------------- */
 static void battery_adc_worker_task(void *arg);
 static void battery_adc_worker_start(void);
 static void battery_adc_ui_timer_cb(lv_timer_t *timer);
@@ -674,6 +986,12 @@ static void sd_card_update_status_label(const char *message);
  * sequencer and directly requests a drive amplitude.
  * ========================================================================== */
 
+/* --------------------------------------------------------------------------
+ * 4.1 DRV2605 register map
+ *
+ * These symbolic names keep register accesses readable. The driver below uses
+ * ordinary I2C register transactions supplied by the board's I2C BSP.
+ * -------------------------------------------------------------------------- */
 #define DRV2605_REG_STATUS 0x00
 #define DRV2605_REG_MODE 0x01
 #define DRV2605_REG_RTPIN 0x02
@@ -1074,8 +1392,11 @@ static void haptic_rtp_test_cb(lv_event_t *e)
  * files beneath that path.
  * ========================================================================== */
 
-#define SD_MOUNT_POINT       "/sdcard"
-#define SD_TEST_FILE_PATH    SD_MOUNT_POINT "/waveshare_sd_test.txt"
+/* --------------------------------------------------------------------------
+ * 5.1 SDMMC board mapping and mount constants
+ * -------------------------------------------------------------------------- */
+#define SD_MOUNT_POINT "/sdcard"
+#define SD_TEST_FILE_PATH SD_MOUNT_POINT "/waveshare_sd_test.txt"
 
 /*
  * Exact SDMMC GPIO assignment for the Waveshare/Guition knob board.
@@ -1083,12 +1404,12 @@ static void haptic_rtp_test_cb(lv_event_t *e)
  * GPIO_NUM_* is used instead of raw integers so the compiler can type-check
  * these assignments against gpio_num_t fields in sdmmc_slot_config_t.
  */
-#define SD_PIN_CLK           GPIO_NUM_4
-#define SD_PIN_CMD           GPIO_NUM_3
-#define SD_PIN_D0            GPIO_NUM_5
-#define SD_PIN_D1            GPIO_NUM_6
-#define SD_PIN_D2            GPIO_NUM_42
-#define SD_PIN_D3            GPIO_NUM_2
+#define SD_PIN_CLK GPIO_NUM_4
+#define SD_PIN_CMD GPIO_NUM_3
+#define SD_PIN_D0 GPIO_NUM_5
+#define SD_PIN_D1 GPIO_NUM_6
+#define SD_PIN_D2 GPIO_NUM_42
+#define SD_PIN_D3 GPIO_NUM_2
 
 /**
  * @brief Mount the TF/microSD card using the ESP32-S3 SDMMC peripheral.
@@ -1106,9 +1427,16 @@ static void haptic_rtp_test_cb(lv_event_t *e)
 static esp_err_t sd_card_mount(void)
 {
     /*
-     * The current board integration uses GPIO42 in both the SD diagnostic
-     * wiring and the microphone clock path. Refuse a new SD mount while the
-     * microphone task still owns its I2S channel.
+     * Conservative legacy mutual-exclusion guard.
+     *
+     * Current verified wiring does NOT share GPIO42 with the microphone:
+     * GPIO42 is SDMMC D2, while the microphone uses GPIO45/46.
+     *
+     * This guard is intentionally retained in this documentation-only cleanup
+     * because removing it would change runtime behavior. It simply prevents a
+     * new SD mount while the microphone diagnostic is transitioning/running.
+     * Once simultaneous SD + microphone operation has been explicitly tested,
+     * this guard is a good candidate for removal.
      */
     if (mic_task_handle != NULL || mic_test_state == MIC_TEST_RUNNING ||
         mic_test_state == MIC_TEST_STARTING || mic_test_state == MIC_TEST_STOPPING)
@@ -1504,34 +1832,55 @@ static void sd_card_update_status_label(const char *message)
  * 6. MICROPHONE / AUDIO DIAGNOSTICS
  * ============================================================================
  *
- * This integrated test intentionally focuses on the microphone that is directly
- * reachable from the ESP32-S3 while the LVGL display is running.
+ * This section contains TWO mutually-exclusive I2S diagnostics.
  *
- * The board's PCM5100A 3.5 mm output lives on the companion/shared audio path.
- * On common JC3636K518/Waveshare wiring, the S3-side PCM5100A I2S signals use
- * GPIO16/17/18, which overlap the active LCD QSPI data pins. Driving those pins
- * as I2S from this firmware would corrupt or disable the display. Therefore the
- * Audio + MIC page reports that topology instead of performing an unsafe tone
- * test from the S3.
+ * A) ONBOARD PDM MICROPHONE
+ *    ----------------------
+ *    GPIO45 = PDM clock
+ *    GPIO46 = PDM data
+ *    I2S0   = PDM RX peripheral
  *
- * The microphone itself is a two-signal PDM device (clock + data) and can be
- * sampled safely. The capture task calculates a simple peak-based level and
- * publishes only scalar values. An LVGL timer turns those values into the live
- * meter on screen.
+ *    ESP32-S3 hardware converts the one-bit PDM stream into signed 16-bit PCM.
+ *    The worker measures LEFT and RIGHT PDM slots separately, subtracts each
+ *    slot's DC average, computes RMS amplitude, and automatically selects the
+ *    slot carrying the useful microphone signal.
+ *
+ *    Only scalar diagnostics are published to the UI:
+ *        mic_level_percent
+ *        mic_rms_raw
+ *        mic_dc_raw
+ *        mic_active_slot
+ *        mic_blocks_read
+ *
+ * B) PCM5100A / 3.5 mm OUTPUT
+ *    ------------------------
+ *    GPIO39 = BCLK
+ *    GPIO40 = LRCK / WS
+ *    GPIO41 = serial audio DATA
+ *    GPIO0  = Waveshare audio-control handoff, HIGH for ESP32-S3
+ *    I2S1   = standard-I2S TX peripheral
+ *
+ *    The TX configuration now mirrors the official Waveshare 07_Audio_Test:
+ *    44.1 kHz, 16-bit, MSB/left-justified, MONO, with MCLK unused.
+ *
+ * IMPORTANT: DAC TX does not overlap the PDM microphone. The official demo
+ * runs MIC RX on GPIO45/46 and DAC TX on GPIO39/40/41 simultaneously.
+ *
+ * The secondary ESP32 still controls PCM5100A XSMT on this board. The companion
+ * firmware must keep XSMT HIGH for DAC output.
+ *
+ * C) REAL-TIME LOOPBACK
+ *    ------------------
+ *    The loopback worker combines the exact factory PDM RX and DAC TX paths:
+ *
+ *        GPIO45/46 -> I2S0 PDM RX -> 16-bit PCM buffer
+ *                   -> DC removal + live 0..200% gain / mute
+ *                   -> I2S1 STD TX -> GPIO39/40/41 -> PCM5100A
+ *
+ *    This provides a functional end-to-end test of microphone capture, PDM
+ *    conversion, sample transport, DAC clocks/data, and analog output.
  * ========================================================================== */
 
-/**
- * @brief Convert a signed 16-bit PCM peak into a useful 0..100 meter value.
- *
- * The PDM hardware converter returns 16-bit PCM. A logarithmic-ish mapping is
- * more useful than a linear full-scale mapping for speech, because normal room
- * sound occupies only a fraction of +/-32767.
- *
- * Peaks below 64 are treated as near-silence. Roughly bit 6 through bit 14 is
- * then spread across the meter. The raw peak remains visible on screen for
- * diagnostics, so this display scaling can be tuned later without obscuring
- * whether the microphone itself is producing data.
- */
 /**
  * @brief Integer square root for a 64-bit value.
  *
@@ -1579,8 +1928,8 @@ static uint32_t mic_isqrt_u64(uint64_t value)
  *      RMS ~= 16384  ->  90%
  *      RMS ~= 32767  -> 100%
  *
- * Unlike the v8 peak meter, a large constant DC offset does not inflate this
- * value because RMS is calculated only after subtracting each slot's mean.
+ * A large constant DC offset does not inflate this meter because RMS is
+ * calculated only after subtracting each slot's mean.
  */
 static int mic_level_from_rms(uint32_t rms)
 {
@@ -1932,16 +2281,21 @@ cleanup:
 static esp_err_t mic_test_start(void)
 {
     /*
-     * GPIO45 cannot simultaneously be the microphone PDM clock and the DAC
-     * standard-I2S data output.
+     * The standalone meter owns I2S0. The real-time loopback worker also needs
+     * I2S0, so those two modes are mutually exclusive even though the MIC and
+     * DAC physical GPIO sets do not overlap.
+     *
+     * The standalone factory tone uses only I2S1 and may coexist with the
+     * standalone MIC meter, but loopback owns BOTH controllers and therefore
+     * excludes both standalone workers.
      */
-    if (dac_tone_task_handle != NULL ||
-        dac_test_state == DAC_TEST_WAITING_FOR_MIC ||
-        dac_test_state == DAC_TEST_STARTING ||
-        dac_test_state == DAC_TEST_RUNNING ||
-        dac_test_state == DAC_TEST_STOPPING)
+    if (loopback_task_handle != NULL ||
+        loopback_test_state == LOOPBACK_TEST_WAITING_FOR_OTHER_AUDIO ||
+        loopback_test_state == LOOPBACK_TEST_STARTING ||
+        loopback_test_state == LOOPBACK_TEST_RUNNING ||
+        loopback_test_state == LOOPBACK_TEST_STOPPING)
     {
-        ESP_LOGW(TAG, "MIC start rejected: DAC tone currently owns shared GPIO45");
+        ESP_LOGW(TAG, "MIC meter start rejected: loopback owns I2S0");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2001,73 +2355,38 @@ static void mic_test_request_stop(void)
  * @brief PCM5100A test-tone worker.
  *
  * This task performs all potentially blocking I2S work outside LVGL context.
- * It first waits for the microphone to release GPIO45, routes the CH445P mux
- * to the S3, initializes standard-I2S TX, and continuously writes a quiet
- * 1 kHz stereo sine wave until stopped.
+ * It waits for the microphone to release GPIO45, applies the selected CH445P
+ * mux state and I2S framing profile, then continuously writes a 1 kHz stereo
+ * diagnostic waveform until stopped.
  */
 static void dac_tone_task(void *arg)
 {
     (void)arg;
 
-    dac_test_state = DAC_TEST_WAITING_FOR_MIC;
-    dac_last_error = ESP_OK;
-
-    /*
-     * GPIO45 is shared. Ask the MIC worker to stop, then wait for it to delete
-     * its PDM I2S channel. The wait is bounded so a broken mic task cannot trap
-     * this worker forever.
-     */
-    mic_test_request_stop();
-
-    const TickType_t wait_step = pdMS_TO_TICKS(20);
-    const int max_wait_steps = 100; /* 2 seconds */
-
-    int wait_steps = 0;
-
-    while ((mic_task_handle != NULL || mic_rx_chan != NULL) &&
-           !dac_tone_stop_requested &&
-           wait_steps < max_wait_steps)
-    {
-        vTaskDelay(wait_step);
-        wait_steps++;
-    }
-
-    if (dac_tone_stop_requested)
-    {
-        goto cleanup;
-    }
-
-    if (mic_task_handle != NULL || mic_rx_chan != NULL)
-    {
-        dac_last_error = ESP_ERR_TIMEOUT;
-        dac_test_state = DAC_TEST_ERROR;
-
-        ESP_LOGE(
-            TAG,
-            "DAC tone: MIC did not release GPIO45 within timeout");
-
-        goto cleanup;
-    }
-
     dac_test_state = DAC_TEST_STARTING;
+    dac_last_error = ESP_OK;
+    dac_blocks_written = 0;
+    dac_control_readback = -1;
 
     /*
-     * CH445P:
-     *   IN LOW  -> S1 inputs -> companion ESP32
-     *   IN HIGH -> S2 inputs -> ESP32-S3
+     * FACTORY STEP 1: hand PCM5100A control to the ESP32-S3.
      *
-     * The schematic wires the S3 I2S signals to S2, so select HIGH.
+     * The official Waveshare audio_bsp.c configures GPIO0 as an output and
+     * immediately drives it HIGH. Its source comment translates to:
+     *
+     *      "give PCM5100A control to ESP32S3"
+     *
+     * We use INPUT_OUTPUT so the UI can also verify the physical pad level.
      */
-    gpio_config_t switch_cfg = {
-        .pin_bit_mask = 1ULL << DAC_I2S_SWITCH_PIN,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
+    gpio_config_t control_cfg = {
+        .pin_bit_mask = 1ULL << DAC_CONTROL_PIN,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
 
-    esp_err_t err =
-        gpio_config(&switch_cfg);
+    esp_err_t err = gpio_config(&control_cfg);
 
     if (err != ESP_OK)
     {
@@ -2076,24 +2395,32 @@ static void dac_tone_task(void *arg)
         goto cleanup;
     }
 
-    gpio_set_level(DAC_I2S_SWITCH_PIN, 1);
+    err = gpio_set_level(DAC_CONTROL_PIN, 1);
+
+    if (err != ESP_OK)
+    {
+        dac_last_error = err;
+        dac_test_state = DAC_TEST_ERROR;
+        goto cleanup;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2));
+    dac_control_readback = gpio_get_level(DAC_CONTROL_PIN);
 
     /*
-     * Use I2S1 for DAC TX. The mic test uses I2S0. They still may not run
-     * simultaneously because of shared GPIO45, but separate peripherals make
-     * ownership and cleanup unambiguous.
+     * FACTORY STEP 2: allocate I2S1 TX as MASTER.
+     *
+     * This mirrors Waveshare's i2s_example_init_std_simplex(). I2S0 remains
+     * available for the PDM microphone.
      */
-    i2s_chan_config_t chan_cfg =
+    i2s_chan_config_t tx_chan_cfg =
         I2S_CHANNEL_DEFAULT_CONFIG(
             I2S_NUM_1,
             I2S_ROLE_MASTER);
 
-    chan_cfg.dma_desc_num = 6;
-    chan_cfg.dma_frame_num = 256;
-
     err =
         i2s_new_channel(
-            &chan_cfg,
+            &tx_chan_cfg,
             &dac_tx_chan,
             NULL);
 
@@ -2101,7 +2428,7 @@ static void dac_tone_task(void *arg)
     {
         ESP_LOGE(
             TAG,
-            "DAC tone: i2s_new_channel failed: %s",
+            "DAC factory test: i2s_new_channel failed: %s",
             esp_err_to_name(err));
 
         dac_last_error = err;
@@ -2110,17 +2437,25 @@ static void dac_tone_task(void *arg)
     }
 
     /*
-     * PCM5100A accepts standard Philips I2S and does not require MCLK when its
-     * internal PLL can lock to BCLK/LRCK.
+     * FACTORY STEP 3: exact 07_Audio_Test TX settings.
+     *
+     *      sample rate  = 44,100 Hz
+     *      width        = 16 bit
+     *      framing      = MSB / left-justified
+     *      slot mode    = MONO (the official LoopbackMode setting)
+     *      MCLK         = unused
+     *      BCLK         = GPIO39
+     *      WS/LRCK      = GPIO40
+     *      DATA OUT     = GPIO41
      */
-    i2s_std_config_t std_cfg = {
+    i2s_std_config_t tx_std_cfg = {
         .clk_cfg =
             I2S_STD_CLK_DEFAULT_CONFIG(DAC_SAMPLE_RATE_HZ),
 
         .slot_cfg =
-            I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+            I2S_STD_MSB_SLOT_DEFAULT_CONFIG(
                 I2S_DATA_BIT_WIDTH_16BIT,
-                I2S_SLOT_MODE_STEREO),
+                I2S_SLOT_MODE_MONO),
 
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
@@ -2140,13 +2475,13 @@ static void dac_tone_task(void *arg)
     err =
         i2s_channel_init_std_mode(
             dac_tx_chan,
-            &std_cfg);
+            &tx_std_cfg);
 
     if (err != ESP_OK)
     {
         ESP_LOGE(
             TAG,
-            "DAC tone: standard-I2S init failed: %s",
+            "DAC factory test: std-mode init failed: %s",
             esp_err_to_name(err));
 
         dac_last_error = err;
@@ -2154,14 +2489,13 @@ static void dac_tone_task(void *arg)
         goto cleanup;
     }
 
-    err =
-        i2s_channel_enable(dac_tx_chan);
+    err = i2s_channel_enable(dac_tx_chan);
 
     if (err != ESP_OK)
     {
         ESP_LOGE(
             TAG,
-            "DAC tone: channel enable failed: %s",
+            "DAC factory test: channel enable failed: %s",
             esp_err_to_name(err));
 
         dac_last_error = err;
@@ -2170,36 +2504,40 @@ static void dac_tone_task(void *arg)
     }
 
     /*
-     * 32-sample sine, peak amplitude ~= 4096 / 32767 = 12.5% full scale.
-     * This intentionally starts quiet for headphones and powered speakers.
+     * Generate exactly 10 cycles of 1 kHz in a 441-sample block.
+     *
+     * At 44.1 kHz, one 1 kHz cycle is 44.1 samples. A 441-sample block is
+     * exactly 10 ms, therefore exactly 10 cycles. Repeating the block creates
+     * a continuous tone without cumulative phase error.
      */
-    static const int16_t sine32[32] = {
-           0,   799,  1567,  2276,  2896,  3406,  3784,  4017,
-        4096,  4017,  3784,  3406,  2896,  2276,  1567,   799,
-           0,  -799, -1567, -2276, -2896, -3406, -3784, -4017,
-       -4096, -4017, -3784, -3406, -2896, -2276, -1567,  -799,
-    };
+    int16_t tone[441];
+    uint32_t phase = 0;
 
-    int16_t stereo_buffer[32 * 2];
+    const int16_t amplitude = 8192; /* 25% of signed 16-bit full scale */
 
-    for (int i = 0; i < 32; ++i)
+    for (size_t i = 0; i < 441; ++i)
     {
-        stereo_buffer[i * 2 + 0] = sine32[i];
-        stereo_buffer[i * 2 + 1] = sine32[i];
+        tone[i] =
+            (phase < (DAC_SAMPLE_RATE_HZ / 2U)) ? amplitude : (int16_t)-amplitude;
+
+        phase += DAC_TONE_HZ;
+
+        if (phase >= DAC_SAMPLE_RATE_HZ)
+        {
+            phase -= DAC_SAMPLE_RATE_HZ;
+        }
     }
 
     dac_test_state = DAC_TEST_RUNNING;
 
     ESP_LOGI(
         TAG,
-        "DAC tone started: %d Hz, %d Hz sample rate, "
-        "BCLK=%d WS=%d DATA=%d MUX=%d(HIGH)",
-        DAC_TONE_HZ,
-        DAC_SAMPLE_RATE_HZ,
+        "DAC FACTORY PATH started: 1kHz, 44100Hz, 16-bit MSB MONO, "
+        "CTRL GPIO0=1/%d, BCLK=%d WS=%d DATA=%d MCLK=unused",
+        dac_control_readback,
         DAC_I2S_BCLK_PIN,
         DAC_I2S_WS_PIN,
-        DAC_I2S_DATA_PIN,
-        DAC_I2S_SWITCH_PIN);
+        DAC_I2S_DATA_PIN);
 
     while (!dac_tone_stop_requested)
     {
@@ -2208,21 +2546,41 @@ static void dac_tone_task(void *arg)
         err =
             i2s_channel_write(
                 dac_tx_chan,
-                stereo_buffer,
-                sizeof(stereo_buffer),
+                tone,
+                sizeof(tone),
                 &bytes_written,
-                pdMS_TO_TICKS(250));
+                pdMS_TO_TICKS(1000));
 
         if (err != ESP_OK)
         {
             ESP_LOGE(
                 TAG,
-                "DAC tone write failed: %s",
+                "DAC factory test write failed: %s",
                 esp_err_to_name(err));
 
             dac_last_error = err;
             dac_test_state = DAC_TEST_ERROR;
             break;
+        }
+
+        if (bytes_written != sizeof(tone))
+        {
+            ESP_LOGW(
+                TAG,
+                "DAC factory short write: wanted=%u wrote=%u",
+                (unsigned)sizeof(tone),
+                (unsigned)bytes_written);
+        }
+
+        dac_blocks_written++;
+
+        if ((dac_blocks_written % 500U) == 0U)
+        {
+            ESP_LOGI(
+                TAG,
+                "DAC FACTORY PATH: blocks=%lu CTRL0=1/%d",
+                (unsigned long)dac_blocks_written,
+                dac_control_readback);
         }
     }
 
@@ -2237,7 +2595,7 @@ cleanup:
         {
             ESP_LOGW(
                 TAG,
-                "DAC tone disable: %s",
+                "DAC factory disable: %s",
                 esp_err_to_name(disable_err));
         }
 
@@ -2248,7 +2606,7 @@ cleanup:
         {
             ESP_LOGW(
                 TAG,
-                "DAC tone delete: %s",
+                "DAC factory delete channel: %s",
                 esp_err_to_name(delete_err));
         }
 
@@ -2256,11 +2614,9 @@ cleanup:
     }
 
     /*
-     * Return the DAC mux to the companion ESP32 when our test is not using it.
-     * That matches the board's normal stock-audio ownership.
+     * Leave GPIO0 HIGH after the test, matching Waveshare's demo. Their audio
+     * initialization asserts the control handoff once and leaves it asserted.
      */
-    gpio_set_level(DAC_I2S_SWITCH_PIN, 0);
-
     if (dac_test_state != DAC_TEST_ERROR)
     {
         dac_test_state = DAC_TEST_STOPPED;
@@ -2270,8 +2626,7 @@ cleanup:
     dac_tone_stop_requested = false;
     dac_tone_task_handle = NULL;
 
-    ESP_LOGI(TAG, "DAC tone task stopped");
-
+    ESP_LOGI(TAG, "DAC FACTORY PATH stopped");
     vTaskDelete(NULL);
 }
 
@@ -2280,8 +2635,21 @@ cleanup:
  */
 static esp_err_t dac_tone_start(void)
 {
+    /*
+     * The factory tone owns I2S1. Real-time loopback also owns I2S1, so never
+     * allow the standalone tone task to start while loopback is active.
+     */
+    if (loopback_task_handle != NULL ||
+        loopback_test_state == LOOPBACK_TEST_WAITING_FOR_OTHER_AUDIO ||
+        loopback_test_state == LOOPBACK_TEST_STARTING ||
+        loopback_test_state == LOOPBACK_TEST_RUNNING ||
+        loopback_test_state == LOOPBACK_TEST_STOPPING)
+    {
+        ESP_LOGW(TAG, "DAC tone start rejected: loopback owns I2S1");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     if (dac_tone_task_handle != NULL ||
-        dac_test_state == DAC_TEST_WAITING_FOR_MIC ||
         dac_test_state == DAC_TEST_STARTING ||
         dac_test_state == DAC_TEST_RUNNING ||
         dac_test_state == DAC_TEST_STOPPING)
@@ -2291,7 +2659,7 @@ static esp_err_t dac_tone_start(void)
 
     dac_tone_stop_requested = false;
     dac_last_error = ESP_OK;
-    dac_test_state = DAC_TEST_WAITING_FOR_MIC;
+    dac_test_state = DAC_TEST_STARTING;
 
     BaseType_t created =
         xTaskCreate(
@@ -2326,11 +2694,9 @@ static void dac_tone_request_stop(void)
         }
 
         /*
-         * Ensure the companion ESP32 owns the audio mux while our S3 test is
-         * idle even if a previous start failed before creating an I2S channel.
+         * GPIO0 stays HIGH once audio control has been handed to the ESP32-S3,
+         * matching the official Waveshare firmware.
          */
-        gpio_set_direction(DAC_I2S_SWITCH_PIN, GPIO_MODE_OUTPUT);
-        gpio_set_level(DAC_I2S_SWITCH_PIN, 0);
         return;
     }
 
@@ -2338,6 +2704,854 @@ static void dac_tone_request_stop(void)
     dac_tone_stop_requested = true;
 }
 
+/* --------------------------------------------------------------------------
+ * 6.5 REAL-TIME MICROPHONE -> PCM5100A LOOPBACK
+ * -------------------------------------------------------------------------- */
+
+/**
+ * @brief Forward live microphone PCM to the PCM5100A using the factory path.
+ *
+ * Hardware/data flow:
+ *
+ *      digital MEMS microphone
+ *             |
+ *             | PDM bitstream
+ *             v
+ *      ESP32-S3 I2S0 PDM RX
+ *             |
+ *             | hardware PDM -> signed 16-bit PCM conversion
+ *             v
+ *      RX buffer (1024 samples / 2048 bytes maximum)
+ *             |
+ *             | subtract measured DC average
+ *             | apply 10% integer gain
+ *             v
+ *      TX buffer
+ *             |
+ *             | 44.1 kHz / 16-bit / MSB / MONO
+ *             v
+ *      ESP32-S3 I2S1 standard TX
+ *             |
+ *             | BCLK39 / WS40 / DATA41
+ *             v
+ *          PCM5100A
+ *             |
+ *             v
+ *         3.5 mm output
+ *
+ * Why use two separate I2S controllers?
+ *
+ * ESP32-S3 I2S0 is configured in PDM receive mode because the onboard
+ * microphone outputs PDM rather than ordinary I2S. I2S1 is simultaneously
+ * configured in standard transmit mode because PCM5100A expects PCM serial
+ * audio. This is exactly the architecture used by Waveshare's official
+ * loopback demo.
+ */
+static void audio_loopback_task(void *arg)
+{
+    (void)arg;
+
+    loopback_last_error = ESP_OK;
+    loopback_blocks = 0;
+    loopback_rms = 0;
+    loopback_output_rms = 0;
+    loopback_dc = 0;
+    loopback_level_percent = 0;
+    loopback_clipped_samples = 0;
+    loopback_control_readback = -1;
+
+    /*
+     * First request clean shutdown of the two standalone audio diagnostics.
+     *
+     * This handoff is asynchronous: those workers own their I2S handles and are
+     * responsible for disabling/deleting them themselves. Deleting another
+     * task's channel from here would create race conditions.
+     */
+    loopback_test_state = LOOPBACK_TEST_WAITING_FOR_OTHER_AUDIO;
+
+    mic_test_request_stop();
+    dac_tone_request_stop();
+
+    /*
+     * Poll for at most two seconds while the standalone workers release I2S0
+     * and I2S1. A short delay yields CPU time to those tasks and avoids spinning
+     * in a busy loop.
+     */
+    const int max_wait_iterations = 100;
+    int wait_iteration = 0;
+
+    while (!loopback_stop_requested &&
+           (mic_task_handle != NULL ||
+            mic_rx_chan != NULL ||
+            dac_tone_task_handle != NULL ||
+            dac_tx_chan != NULL) &&
+           wait_iteration < max_wait_iterations)
+    {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        wait_iteration++;
+    }
+
+    if (loopback_stop_requested)
+    {
+        goto cleanup;
+    }
+
+    if (mic_task_handle != NULL ||
+        mic_rx_chan != NULL ||
+        dac_tone_task_handle != NULL ||
+        dac_tx_chan != NULL)
+    {
+        ESP_LOGE(
+            TAG,
+            "Loopback: standalone audio workers did not release I2S in time");
+
+        loopback_last_error = ESP_ERR_TIMEOUT;
+        loopback_test_state = LOOPBACK_TEST_ERROR;
+        goto cleanup;
+    }
+
+    loopback_test_state = LOOPBACK_TEST_STARTING;
+
+    /*
+     * FACTORY CONTROL HANDOFF
+     * -----------------------
+     * Waveshare drives GPIO0 HIGH before initializing audio. Their source
+     * comment explicitly identifies this as giving PCM5100A control to the
+     * ESP32-S3.
+     *
+     * INPUT_OUTPUT lets us verify the physical pad level after driving it.
+     */
+    gpio_config_t control_cfg = {
+        .pin_bit_mask = 1ULL << DAC_CONTROL_PIN,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    esp_err_t err = gpio_config(&control_cfg);
+
+    if (err != ESP_OK)
+    {
+        loopback_last_error = err;
+        loopback_test_state = LOOPBACK_TEST_ERROR;
+        goto cleanup;
+    }
+
+    err = gpio_set_level(DAC_CONTROL_PIN, 1);
+
+    if (err != ESP_OK)
+    {
+        loopback_last_error = err;
+        loopback_test_state = LOOPBACK_TEST_ERROR;
+        goto cleanup;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2));
+    loopback_control_readback = gpio_get_level(DAC_CONTROL_PIN);
+
+    /*
+     * ALLOCATE I2S1 TRANSMIT CHANNEL
+     * -----------------------------
+     * PCM5100A is a standard PCM DAC, so I2S1 runs in normal/STD transmit mode.
+     */
+    i2s_chan_config_t tx_chan_cfg =
+        I2S_CHANNEL_DEFAULT_CONFIG(
+            I2S_NUM_1,
+            I2S_ROLE_MASTER);
+
+    err =
+        i2s_new_channel(
+            &tx_chan_cfg,
+            &loopback_tx_chan,
+            NULL);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Loopback: I2S1 TX allocation failed: %s",
+            esp_err_to_name(err));
+
+        loopback_last_error = err;
+        loopback_test_state = LOOPBACK_TEST_ERROR;
+        goto cleanup;
+    }
+
+    /*
+     * Configure I2S1 exactly like Waveshare's LoopbackMode:
+     *
+     *      44.1 kHz
+     *      signed 16-bit samples
+     *      MSB/left-justified framing
+     *      MONO
+     *      no MCLK
+     *      BCLK GPIO39
+     *      WS   GPIO40
+     *      DOUT GPIO41
+     */
+    i2s_std_config_t tx_std_cfg = {
+        .clk_cfg =
+            I2S_STD_CLK_DEFAULT_CONFIG(LOOPBACK_SAMPLE_RATE_HZ),
+
+        .slot_cfg =
+            I2S_STD_MSB_SLOT_DEFAULT_CONFIG(
+                I2S_DATA_BIT_WIDTH_16BIT,
+                I2S_SLOT_MODE_MONO),
+
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = DAC_I2S_BCLK_PIN,
+            .ws = DAC_I2S_WS_PIN,
+            .dout = DAC_I2S_DATA_PIN,
+            .din = I2S_GPIO_UNUSED,
+
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+
+    err =
+        i2s_channel_init_std_mode(
+            loopback_tx_chan,
+            &tx_std_cfg);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Loopback: I2S1 STD init failed: %s",
+            esp_err_to_name(err));
+
+        loopback_last_error = err;
+        loopback_test_state = LOOPBACK_TEST_ERROR;
+        goto cleanup;
+    }
+
+    /*
+     * ALLOCATE I2S0 PDM RECEIVE CHANNEL
+     * ---------------------------------
+     * The microphone does not output PCM directly. Its GPIO46 data signal is a
+     * dense one-bit PDM stream clocked by GPIO45. ESP32-S3's PDM RX hardware
+     * decimates/filter-converts that stream into ordinary signed 16-bit PCM
+     * before i2s_channel_read() returns to this task.
+     */
+    i2s_chan_config_t rx_chan_cfg =
+        I2S_CHANNEL_DEFAULT_CONFIG(
+            I2S_NUM_0,
+            I2S_ROLE_MASTER);
+
+    err =
+        i2s_new_channel(
+            &rx_chan_cfg,
+            NULL,
+            &loopback_rx_chan);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Loopback: I2S0 PDM RX allocation failed: %s",
+            esp_err_to_name(err));
+
+        loopback_last_error = err;
+        loopback_test_state = LOOPBACK_TEST_ERROR;
+        goto cleanup;
+    }
+
+    /*
+     * Match Waveshare's PDM receive setup exactly:
+     *
+     *      44.1 kHz output PCM rate
+     *      16-bit
+     *      MONO
+     *      PDM clock GPIO45
+     *      PDM data  GPIO46
+     */
+    i2s_pdm_rx_config_t pdm_rx_cfg = {
+        .clk_cfg =
+            I2S_PDM_RX_CLK_DEFAULT_CONFIG(LOOPBACK_SAMPLE_RATE_HZ),
+
+        .slot_cfg =
+            I2S_PDM_RX_SLOT_DEFAULT_CONFIG(
+                I2S_DATA_BIT_WIDTH_16BIT,
+                I2S_SLOT_MODE_MONO),
+
+        .gpio_cfg = {
+            .clk = MIC_PDM_CLK_PIN,
+            .din = MIC_PDM_DATA_PIN,
+
+            .invert_flags = {
+                .clk_inv = false,
+            },
+        },
+    };
+
+    err =
+        i2s_channel_init_pdm_rx_mode(
+            loopback_rx_chan,
+            &pdm_rx_cfg);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Loopback: I2S0 PDM init failed: %s",
+            esp_err_to_name(err));
+
+        loopback_last_error = err;
+        loopback_test_state = LOOPBACK_TEST_ERROR;
+        goto cleanup;
+    }
+
+    /*
+     * Enable TX first, then RX, following the initialization order in the
+     * official demo. Once both channels are enabled, the read/write loop below
+     * becomes a real-time software bridge between the two peripherals.
+     */
+    err = i2s_channel_enable(loopback_tx_chan);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Loopback: I2S1 enable failed: %s",
+            esp_err_to_name(err));
+
+        loopback_last_error = err;
+        loopback_test_state = LOOPBACK_TEST_ERROR;
+        goto cleanup;
+    }
+
+    err = i2s_channel_enable(loopback_rx_chan);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Loopback: I2S0 enable failed: %s",
+            esp_err_to_name(err));
+
+        loopback_last_error = err;
+        loopback_test_state = LOOPBACK_TEST_ERROR;
+        goto cleanup;
+    }
+
+    /*
+     * 2048 bytes == 1024 signed 16-bit mono samples.
+     *
+     * At 44.1 kHz this buffer represents about 23 ms of audio:
+     *
+     *      1024 / 44100 ~= 0.0232 seconds
+     *
+     * That is short enough for a clear hardware loopback test while still
+     * keeping the number of FreeRTOS/I2S calls modest.
+     */
+    int16_t rx_samples[LOOPBACK_BUFFER_BYTES / sizeof(int16_t)];
+    int16_t tx_samples[LOOPBACK_BUFFER_BYTES / sizeof(int16_t)];
+
+    loopback_test_state = LOOPBACK_TEST_RUNNING;
+
+    ESP_LOGI(
+        TAG,
+        "MIC LOOPBACK started: 44100Hz 16-bit MONO, gain=%d%% mute=%d, "
+        "RX CLK=%d DATA=%d, TX BCLK=%d WS=%d DATA=%d, CTRL0=1/%d",
+        loopback_gain_percent,
+        loopback_muted ? 1 : 0,
+        MIC_PDM_CLK_PIN,
+        MIC_PDM_DATA_PIN,
+        DAC_I2S_BCLK_PIN,
+        DAC_I2S_WS_PIN,
+        DAC_I2S_DATA_PIN,
+        loopback_control_readback);
+
+    while (!loopback_stop_requested)
+    {
+        size_t bytes_read = 0;
+
+        /*
+         * The timeout argument for the modern ESP-IDF I2S channel API is in
+         * milliseconds. Waveshare uses 1000 ms in its demo; we retain that
+         * value so temporary scheduling delays do not incorrectly look like a
+         * microphone failure.
+         */
+        err =
+            i2s_channel_read(
+                loopback_rx_chan,
+                rx_samples,
+                sizeof(rx_samples),
+                &bytes_read,
+                1000);
+
+        if (err == ESP_ERR_TIMEOUT)
+        {
+            continue;
+        }
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "Loopback: microphone read failed: %s",
+                esp_err_to_name(err));
+
+            loopback_last_error = err;
+            loopback_test_state = LOOPBACK_TEST_ERROR;
+            break;
+        }
+
+        const size_t sample_count =
+            bytes_read / sizeof(rx_samples[0]);
+
+        if (sample_count == 0)
+        {
+            continue;
+        }
+
+        /*
+         * PASS 1: measure the DC average.
+         *
+         * A PDM microphone and its digital filter can sit noticeably above or
+         * below numerical zero even in silence. That constant bias is not useful
+         * audio, so we measure it once per block before calculating RMS/playback.
+         */
+        int64_t sum = 0;
+
+        for (size_t i = 0; i < sample_count; ++i)
+        {
+            sum += rx_samples[i];
+        }
+
+        const int32_t mean =
+            (int32_t)(sum / (int64_t)sample_count);
+
+        /*
+         * PASS 2: remove DC, measure INPUT RMS, apply live gain/mute, and
+         * measure OUTPUT RMS.
+         *
+         * Snapshot the UI controls once per block.
+         *
+         * The gain slider and mute button live in the LVGL task while this code
+         * runs in the audio worker. Reading the volatile globals for every
+         * individual sample would allow the user to change gain halfway through
+         * one 2048-byte block. That would not be dangerous, but it would make a
+         * single block internally inconsistent.
+         *
+         * Instead every sample in this block uses the same captured values.
+         */
+        int block_gain = loopback_gain_percent;
+        const bool block_muted = loopback_muted;
+
+        /*
+         * Clamp the snapshot defensively.
+         *
+         * The LVGL slider is already constrained to 0..200, but this protects
+         * the DSP if the value is ever changed from another code path later.
+         */
+        if (block_gain < LOOPBACK_GAIN_MIN_PERCENT)
+        {
+            block_gain = LOOPBACK_GAIN_MIN_PERCENT;
+        }
+        else if (block_gain > LOOPBACK_GAIN_MAX_PERCENT)
+        {
+            block_gain = LOOPBACK_GAIN_MAX_PERCENT;
+        }
+
+        uint64_t input_square_sum = 0;
+        uint64_t output_square_sum = 0;
+        uint32_t clipped_this_block = 0;
+
+        for (size_t i = 0; i < sample_count; ++i)
+        {
+            const int32_t centered =
+                (int32_t)rx_samples[i] - mean;
+
+            /*
+             * INPUT RMS is measured before gain/mute so it continues to describe
+             * the microphone itself regardless of playback settings.
+             */
+            input_square_sum +=
+                (uint64_t)((int64_t)centered * (int64_t)centered);
+
+            int32_t scaled = 0;
+
+            if (!block_muted)
+            {
+                /*
+                 * Integer gain law:
+                 *
+                 *      0% -> silence
+                 *     50% -> half amplitude
+                 *    100% -> unity
+                 *    200% -> double amplitude
+                 *
+                 * centered can span roughly -65535..+65535 after DC removal.
+                 * Multiplying by at most 200 easily fits in signed int32_t.
+                 */
+                scaled =
+                    (centered * block_gain) / 100;
+
+                /*
+                 * Saturate instead of wrapping.
+                 *
+                 * At gain above 100%, loud microphone peaks can exceed the
+                 * signed 16-bit range. A raw cast would wrap positive overloads
+                 * into negative values (and vice versa), producing harsh digital
+                 * corruption. Saturation clips cleanly at the representable
+                 * endpoints and increments diagnostic telemetry.
+                 */
+                if (scaled > INT16_MAX)
+                {
+                    scaled = INT16_MAX;
+                    clipped_this_block++;
+                }
+                else if (scaled < INT16_MIN)
+                {
+                    scaled = INT16_MIN;
+                    clipped_this_block++;
+                }
+            }
+
+            tx_samples[i] = (int16_t)scaled;
+
+            output_square_sum +=
+                (uint64_t)((int64_t)scaled * (int64_t)scaled);
+        }
+
+        const uint32_t input_rms =
+            mic_isqrt_u64(
+                input_square_sum / (uint64_t)sample_count);
+
+        const uint32_t output_rms =
+            mic_isqrt_u64(
+                output_square_sum / (uint64_t)sample_count);
+
+        loopback_dc = mean;
+        loopback_rms = input_rms;
+        loopback_output_rms = output_rms;
+        loopback_level_percent = mic_level_from_rms(input_rms);
+        loopback_clipped_samples = clipped_this_block;
+
+        /*
+         * Forward only the number of bytes actually received. This matters if a
+         * read ever returns a short buffer rather than the full 2048 bytes.
+         */
+        size_t bytes_written = 0;
+
+        err =
+            i2s_channel_write(
+                loopback_tx_chan,
+                tx_samples,
+                bytes_read,
+                &bytes_written,
+                1000);
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "Loopback: DAC write failed: %s",
+                esp_err_to_name(err));
+
+            loopback_last_error = err;
+            loopback_test_state = LOOPBACK_TEST_ERROR;
+            break;
+        }
+
+        if (bytes_written != bytes_read)
+        {
+            ESP_LOGW(
+                TAG,
+                "Loopback short write: read=%u wrote=%u",
+                (unsigned)bytes_read,
+                (unsigned)bytes_written);
+        }
+
+        loopback_blocks++;
+
+        /*
+         * Publish enough serial telemetry to prove sustained operation without
+         * flooding the monitor with one line every ~23 ms.
+         */
+        if ((loopback_blocks % 100U) == 0U)
+        {
+            ESP_LOGI(
+                TAG,
+                "MIC LOOPBACK: blocks=%lu inRMS=%lu outRMS=%lu "
+                "DC=%ld level=%d%% gain=%d%% mute=%d clip=%lu",
+                (unsigned long)loopback_blocks,
+                (unsigned long)loopback_rms,
+                (unsigned long)loopback_output_rms,
+                (long)loopback_dc,
+                loopback_level_percent,
+                loopback_gain_percent,
+                loopback_muted ? 1 : 0,
+                (unsigned long)loopback_clipped_samples);
+        }
+    }
+
+cleanup:
+    /*
+     * Each channel is disabled and deleted by the same task that created it.
+     * This ownership rule prevents one FreeRTOS task from tearing down hardware
+     * while another task might still be inside a blocking I2S API call.
+     */
+    if (loopback_rx_chan != NULL)
+    {
+        esp_err_t disable_err =
+            i2s_channel_disable(loopback_rx_chan);
+
+        if (disable_err != ESP_OK &&
+            disable_err != ESP_ERR_INVALID_STATE)
+        {
+            ESP_LOGW(
+                TAG,
+                "Loopback RX disable: %s",
+                esp_err_to_name(disable_err));
+        }
+
+        esp_err_t delete_err =
+            i2s_del_channel(loopback_rx_chan);
+
+        if (delete_err != ESP_OK)
+        {
+            ESP_LOGW(
+                TAG,
+                "Loopback RX delete: %s",
+                esp_err_to_name(delete_err));
+        }
+
+        loopback_rx_chan = NULL;
+    }
+
+    if (loopback_tx_chan != NULL)
+    {
+        esp_err_t disable_err =
+            i2s_channel_disable(loopback_tx_chan);
+
+        if (disable_err != ESP_OK &&
+            disable_err != ESP_ERR_INVALID_STATE)
+        {
+            ESP_LOGW(
+                TAG,
+                "Loopback TX disable: %s",
+                esp_err_to_name(disable_err));
+        }
+
+        esp_err_t delete_err =
+            i2s_del_channel(loopback_tx_chan);
+
+        if (delete_err != ESP_OK)
+        {
+            ESP_LOGW(
+                TAG,
+                "Loopback TX delete: %s",
+                esp_err_to_name(delete_err));
+        }
+
+        loopback_tx_chan = NULL;
+    }
+
+    /*
+     * GPIO0 remains HIGH after shutdown, just like Waveshare's audio demo.
+     * Keeping the verified control handoff asserted avoids needless toggling of
+     * the PCM5100A path between diagnostics.
+     */
+    if (loopback_test_state != LOOPBACK_TEST_ERROR)
+    {
+        loopback_test_state = LOOPBACK_TEST_STOPPED;
+        loopback_last_error = ESP_OK;
+    }
+
+    loopback_stop_requested = false;
+    loopback_task_handle = NULL;
+
+    ESP_LOGI(TAG, "MIC LOOPBACK stopped");
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief Start the loopback worker.
+ *
+ * Starting the task is intentionally lightweight. The task itself performs the
+ * orderly handoff from standalone MIC/tone workers and owns all subsequent I2S
+ * setup. This keeps LVGL button callbacks fast and non-blocking.
+ */
+static esp_err_t audio_loopback_start(void)
+{
+    if (loopback_task_handle != NULL ||
+        loopback_test_state == LOOPBACK_TEST_WAITING_FOR_OTHER_AUDIO ||
+        loopback_test_state == LOOPBACK_TEST_STARTING ||
+        loopback_test_state == LOOPBACK_TEST_RUNNING ||
+        loopback_test_state == LOOPBACK_TEST_STOPPING)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    loopback_stop_requested = false;
+    loopback_last_error = ESP_OK;
+    loopback_blocks = 0;
+    loopback_rms = 0;
+    loopback_output_rms = 0;
+    loopback_dc = 0;
+    loopback_level_percent = 0;
+    loopback_clipped_samples = 0;
+
+    /*
+     * Every new loopback session starts audible. Gain persists at the user's
+     * current slider setting, while mute resets so a forgotten mute state does
+     * not make a healthy pipeline appear broken on the next test.
+     */
+    loopback_muted = false;
+
+    loopback_test_state = LOOPBACK_TEST_WAITING_FOR_OTHER_AUDIO;
+
+    BaseType_t created =
+        xTaskCreate(
+            audio_loopback_task,
+            "audio_loopback",
+            LOOPBACK_TASK_STACK_SIZE,
+            NULL,
+            5,
+            &loopback_task_handle);
+
+    if (created != pdPASS)
+    {
+        loopback_task_handle = NULL;
+        loopback_last_error = ESP_ERR_NO_MEM;
+        loopback_test_state = LOOPBACK_TEST_ERROR;
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Ask the loopback worker to stop asynchronously.
+ *
+ * The worker may be blocked in an I2S read for up to one second, so the stop is
+ * a request rather than an immediate channel deletion. Once the blocking call
+ * returns, the worker sees this flag and performs its own cleanup.
+ */
+static void audio_loopback_request_stop(void)
+{
+    if (loopback_task_handle == NULL)
+    {
+        if (loopback_test_state != LOOPBACK_TEST_ERROR)
+        {
+            loopback_test_state = LOOPBACK_TEST_STOPPED;
+        }
+
+        return;
+    }
+
+    loopback_test_state = LOOPBACK_TEST_STOPPING;
+    loopback_stop_requested = true;
+}
+
+/**
+ * @brief LVGL callback that starts real-time microphone playback.
+ *
+ * A successful start may briefly display "waiting" while the worker asks any
+ * standalone MIC meter/tone tasks to release their I2S controllers.
+ */
+static void audio_loopback_start_cb(lv_event_t *e)
+{
+    (void)e;
+
+    esp_err_t err = audio_loopback_start();
+
+    if (err != ESP_OK &&
+        audio_loopback_status_label != NULL)
+    {
+        lv_label_set_text_fmt(
+            audio_loopback_status_label,
+            "Loopback start failed\n%s",
+            esp_err_to_name(err));
+    }
+}
+
+/**
+ * @brief LVGL callback that requests loopback shutdown.
+ */
+static void audio_loopback_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    audio_loopback_request_stop();
+}
+
+/**
+ * @brief Apply a new loopback playback gain from the LVGL slider.
+ *
+ * This callback does not touch either I2S peripheral. It only updates a small
+ * scalar setting. The audio worker snapshots that value at the start of its next
+ * PCM block, so gain changes are effectively live without rebuilding or
+ * restarting the loopback pipeline.
+ */
+static void audio_loopback_gain_changed_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target_obj(e);
+
+    int value =
+        (int)lv_slider_get_value(slider);
+
+    if (value < LOOPBACK_GAIN_MIN_PERCENT)
+    {
+        value = LOOPBACK_GAIN_MIN_PERCENT;
+    }
+    else if (value > LOOPBACK_GAIN_MAX_PERCENT)
+    {
+        value = LOOPBACK_GAIN_MAX_PERCENT;
+    }
+
+    loopback_gain_percent = value;
+
+    if (audio_loopback_gain_label != NULL)
+    {
+        lv_label_set_text_fmt(
+            audio_loopback_gain_label,
+            "Loopback Gain: %d%%",
+            loopback_gain_percent);
+    }
+}
+
+/**
+ * @brief Toggle playback mute without stopping either I2S channel.
+ *
+ * Mute is implemented in the PCM processing stage rather than by tearing down
+ * I2S1 or changing PCM5100A control pins. While muted:
+ *
+ *   - microphone capture continues;
+ *   - input RMS/DC telemetry continues;
+ *   - the worker writes zero-valued PCM samples to the DAC;
+ *   - output RMS becomes zero;
+ *   - unmuting is immediate on the next audio block.
+ *
+ * This makes mute useful as an emergency feedback-kill switch while preserving
+ * the entire verified hardware path.
+ */
+static void audio_loopback_toggle_mute_cb(lv_event_t *e)
+{
+    (void)e;
+
+    loopback_muted = !loopback_muted;
+
+    ESP_LOGI(
+        TAG,
+        "MIC LOOPBACK mute=%d gain=%d%%",
+        loopback_muted ? 1 : 0,
+        loopback_gain_percent);
+}
+
+/**
+ * @brief Start microphone capture from the Audio + MIC page.
+ *
+ * The callback does not capture samples itself. It only requests creation of the
+ * PDM worker, which keeps I2S setup and blocking reads out of the LVGL event path.
+ */
 static void audio_mic_start_cb(lv_event_t *e)
 {
     (void)e;
@@ -2353,18 +3567,26 @@ static void audio_mic_start_cb(lv_event_t *e)
     }
 }
 
+/**
+ * @brief Request an asynchronous stop of the microphone diagnostic.
+ *
+ * The worker notices the stop flag, disables/deletes its I2S channel, then marks
+ * the state STOPPED. This avoids deleting a peripheral from the UI callback.
+ */
 static void audio_mic_stop_cb(lv_event_t *e)
 {
     (void)e;
     mic_test_request_stop();
 }
 
+/**
+ * @brief Start the exact Waveshare factory-path 1 kHz tone diagnostic.
+ */
 static void audio_dac_start_tone_cb(lv_event_t *e)
 {
     (void)e;
 
-    esp_err_t err =
-        dac_tone_start();
+    esp_err_t err = dac_tone_start();
 
     if (err != ESP_OK &&
         audio_dac_info_label != NULL)
@@ -2376,6 +3598,9 @@ static void audio_dac_start_tone_cb(lv_event_t *e)
     }
 }
 
+/**
+ * @brief Request the PCM5100A tone worker to stop and release I2S1.
+ */
 static void audio_dac_stop_tone_cb(lv_event_t *e)
 {
     (void)e;
@@ -2393,17 +3618,26 @@ static void audio_mic_output_info_cb(lv_event_t *e)
     {
         lv_label_set_text(
             audio_dac_info_label,
-            "PCM5100A via CH445P\n"
-            "BCLK39  WS44  DATA45\n"
-            "MUX GPIO40 HIGH = S3");
+            "Official Waveshare audio path\n"
+            "MIC: CLK45 DATA46\n"
+            "DAC: BCLK39 WS40 DATA41\n"
+            "CTRL0=HIGH, MCLK unused");
     }
 }
 
+/**
+ * @brief Leave the Audio + MIC page safely.
+ *
+ * All audio workers receive stop requests before navigation. The standalone
+ * MIC and tone use separate controllers, while loopback owns both simultaneously;
+ * requesting all three to stop guarantees the page leaves no audio task behind.
+ */
 static void audio_mic_back_cb(lv_event_t *e)
 {
     (void)e;
     mic_test_request_stop();
     dac_tone_request_stop();
+    audio_loopback_request_stop();
     pop_menu();
 }
 
@@ -2419,24 +3653,54 @@ static void audio_mic_ui_timer_cb(lv_timer_t *timer)
         return;
     }
 
+    /*
+     * The same meter visualizes whichever microphone consumer currently owns
+     * I2S0. During standalone MIC mode it uses the existing 16 kHz diagnostics;
+     * during loopback it uses the 44.1 kHz loopback worker's RMS values.
+     */
+    const bool loopback_is_active =
+        loopback_test_state == LOOPBACK_TEST_RUNNING ||
+        loopback_test_state == LOOPBACK_TEST_STARTING ||
+        loopback_test_state == LOOPBACK_TEST_STOPPING;
+
+    const int displayed_level =
+        loopback_is_active ? loopback_level_percent : mic_level_percent;
+
     if (audio_mic_level_bar != NULL)
     {
         lv_bar_set_value(
             audio_mic_level_bar,
-            mic_level_percent,
+            displayed_level,
             LV_ANIM_OFF);
     }
 
     if (audio_mic_peak_label != NULL)
     {
-        lv_label_set_text_fmt(
-            audio_mic_peak_label,
-            "Level %d%%  RMS %lu\nDC %ld  Slot %c  Blocks %lu",
-            mic_level_percent,
-            (unsigned long)mic_rms_raw,
-            (long)mic_dc_raw,
-            mic_active_slot == 0 ? 'R' : 'L',
-            (unsigned long)mic_blocks_read);
+        if (loopback_is_active)
+        {
+            lv_label_set_text_fmt(
+                audio_mic_peak_label,
+                "In RMS %lu  Out RMS %lu  Level %d%%\n"
+                "DC %ld  Gain %d%%  %s  Clip %lu",
+                (unsigned long)loopback_rms,
+                (unsigned long)loopback_output_rms,
+                loopback_level_percent,
+                (long)loopback_dc,
+                loopback_gain_percent,
+                loopback_muted ? "MUTED" : "PLAY",
+                (unsigned long)loopback_clipped_samples);
+        }
+        else
+        {
+            lv_label_set_text_fmt(
+                audio_mic_peak_label,
+                "Level %d%%  RMS %lu\nDC %ld  Slot %c  Blocks %lu",
+                mic_level_percent,
+                (unsigned long)mic_rms_raw,
+                (long)mic_dc_raw,
+                mic_active_slot == 0 ? 'R' : 'L',
+                (unsigned long)mic_blocks_read);
+        }
     }
 
     if (audio_mic_status_label == NULL)
@@ -2456,10 +3720,10 @@ static void audio_mic_ui_timer_cb(lv_timer_t *timer)
             break;
 
         case DAC_TEST_WAITING_FOR_MIC:
+            /* Legacy enum value retained for compatibility; v17+ does not use it. */
             lv_label_set_text(
                 audio_dac_info_label,
-                "PCM5100A: waiting for MIC\n"
-                "Releasing shared GPIO45...");
+                "PCM5100A: waiting...");
             break;
 
         case DAC_TEST_STARTING:
@@ -2469,10 +3733,12 @@ static void audio_mic_ui_timer_cb(lv_timer_t *timer)
             break;
 
         case DAC_TEST_RUNNING:
-            lv_label_set_text(
+            lv_label_set_text_fmt(
                 audio_dac_info_label,
-                "PCM5100A: LIVE\n"
-                "1 kHz tone @ 12.5% full scale");
+                "FACTORY TX LIVE\n"
+                "CTRL0 1/%d  Blocks %lu",
+                dac_control_readback,
+                (unsigned long)dac_blocks_written);
             break;
 
         case DAC_TEST_STOPPING:
@@ -2486,6 +3752,69 @@ static void audio_mic_ui_timer_cb(lv_timer_t *timer)
                 audio_dac_info_label,
                 "PCM5100A error\n%s",
                 esp_err_to_name(dac_last_error));
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    if (audio_loopback_gain_label != NULL)
+    {
+        lv_label_set_text_fmt(
+            audio_loopback_gain_label,
+            "Loopback Gain: %d%%",
+            loopback_gain_percent);
+    }
+
+    if (audio_loopback_status_label != NULL)
+    {
+        switch (loopback_test_state)
+        {
+        case LOOPBACK_TEST_STOPPED:
+            lv_label_set_text_fmt(
+                audio_loopback_status_label,
+                "Loopback: stopped\n"
+                "Gain %d%%  %s",
+                loopback_gain_percent,
+                loopback_muted ? "MUTED" : "PLAY");
+            break;
+
+        case LOOPBACK_TEST_WAITING_FOR_OTHER_AUDIO:
+            lv_label_set_text(
+                audio_loopback_status_label,
+                "Loopback: waiting...\n"
+                "Stopping standalone MIC / tone");
+            break;
+
+        case LOOPBACK_TEST_STARTING:
+            lv_label_set_text(
+                audio_loopback_status_label,
+                "Loopback: starting factory audio path...");
+            break;
+
+        case LOOPBACK_TEST_RUNNING:
+            lv_label_set_text_fmt(
+                audio_loopback_status_label,
+                "LOOPBACK LIVE  44.1k / 16b / MSB\n"
+                "CTRL0 1/%d  Gain %d%%  %s  Blocks %lu",
+                loopback_control_readback,
+                loopback_gain_percent,
+                loopback_muted ? "MUTED" : "PLAY",
+                (unsigned long)loopback_blocks);
+            break;
+
+        case LOOPBACK_TEST_STOPPING:
+            lv_label_set_text(
+                audio_loopback_status_label,
+                "Loopback: stopping...");
+            break;
+
+        case LOOPBACK_TEST_ERROR:
+            lv_label_set_text_fmt(
+                audio_loopback_status_label,
+                "Loopback error\n%s",
+                esp_err_to_name(loopback_last_error));
             break;
 
         default:
@@ -2748,14 +4077,14 @@ static int battery_percent_from_mv(int mv)
     } point_t;
 
     static const point_t curve[] = {
-        {3300,   0},
-        {3450,  10},
-        {3600,  20},
-        {3700,  40},
-        {3800,  60},
-        {3900,  75},
-        {4000,  85},
-        {4100,  95},
+        {3300, 0},
+        {3450, 10},
+        {3600, 20},
+        {3700, 40},
+        {3800, 60},
+        {3900, 75},
+        {4000, 85},
+        {4100, 95},
         {4200, 100},
     };
 
@@ -2786,7 +4115,7 @@ static int battery_percent_from_mv(int mv)
                 curve[i].pct - curve[i - 1].pct;
 
             return curve[i - 1].pct +
-                (into_mv * span_pct) / span_mv;
+                   (into_mv * span_pct) / span_mv;
         }
     }
 
@@ -3061,6 +4390,15 @@ static void battery_adc_ui_timer_cb(lv_timer_t *timer)
  * translates UI input into logical media commands.
  * ========================================================================== */
 
+/* --------------------------------------------------------------------------
+ * 8.1 Thin UI-to-HID command bridge
+ * -------------------------------------------------------------------------- */
+/**
+ * @brief Send one logical Consumer Control command through the BLE HID module.
+ *
+ * ESP_ERR_INVALID_STATE is treated as an expected 'not connected' condition rather
+ * than a fatal error, because the local UI must remain usable without a BLE host.
+ */
 static void media_send_from_ui(media_control_key_t key, const char *name)
 {
     esp_err_t err = media_controller_send(key);
@@ -3080,36 +4418,57 @@ static void media_send_from_ui(media_control_key_t key, const char *name)
     ESP_LOGW(TAG, "Media command failed (%s): %s", name, esp_err_to_name(err));
 }
 
+/**
+ * @brief Open the PC Media Controller page and preserve the current page for Back.
+ */
 static void open_media_controller_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_MEDIA_CONTROLLER);
 }
 
+/**
+ * @brief Translate the Previous button press into a BLE HID previous-track command.
+ */
 static void media_previous_cb(lv_event_t *e)
 {
     (void)e;
     media_send_from_ui(MEDIA_CONTROL_PREVIOUS_TRACK, "previous track");
 }
 
+/**
+ * @brief Translate the Play/Pause button press into a BLE HID toggle command.
+ */
 static void media_play_pause_cb(lv_event_t *e)
 {
     (void)e;
     media_send_from_ui(MEDIA_CONTROL_PLAY_PAUSE, "play/pause");
 }
 
+/**
+ * @brief Translate the Next button press into a BLE HID next-track command.
+ */
 static void media_next_cb(lv_event_t *e)
 {
     (void)e;
     media_send_from_ui(MEDIA_CONTROL_NEXT_TRACK, "next track");
 }
 
+/**
+ * @brief Translate the Mute button press into a BLE HID mute command.
+ */
 static void media_mute_cb(lv_event_t *e)
 {
     (void)e;
     media_send_from_ui(MEDIA_CONTROL_MUTE, "mute");
 }
 
+/**
+ * @brief Refresh BLE connection text from LVGL context.
+ *
+ * Bluetooth callbacks do not touch LVGL objects directly; polling the module from
+ * this timer preserves the single-UI-context rule.
+ */
 static void media_status_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -3167,18 +4526,20 @@ static lv_obj_t *create_menu_container(void)
 /**
  * @brief Create one standard menu button.
  *
- * Each normal menu button intentionally has two event callbacks:
+ * Each normal menu button intentionally receives TWO LV_EVENT_PRESSED
+ * callbacks:
  *
- *   LV_EVENT_PRESSED
- *       Runs immediately when the finger touches the button. This is used only
- *       for tactile feedback so the interface feels responsive.
+ *   1. button_press_haptic_cb()
+ *      Starts tactile feedback immediately on finger-down.
  *
- *   LV_EVENT_CLICKED
- *       Runs after LVGL recognizes a complete press-and-release click. This is
- *       used for the button's actual action (open a menu, go Back, etc.).
+ *   2. the page/action callback
+ *      Performs navigation or the requested action on the same finger-down
+ *      event. The project deliberately uses PRESSED rather than CLICKED so the
+ *      interface reacts before the finger is released.
  *
- * Keeping these two jobs separate means haptic feedback happens immediately,
- * while navigation still uses normal LVGL click semantics.
+ * Callback registration order matters here: the generic haptic callback is
+ * added first, then the action callback. The dedicated Haptic Motor Test page
+ * suppresses the generic click so its test effects are not masked.
  */
 static lv_obj_t *create_menu_button(
     lv_obj_t *parent,
@@ -3220,7 +4581,6 @@ static lv_obj_t *create_menu_button(
 
     return button;
 }
-
 
 /**
  * @brief Provide immediate generic haptic feedback for normal UI buttons.
@@ -3277,6 +4637,9 @@ static void show_menu(menu_id_t menu)
     audio_mic_level_bar = NULL;
     audio_mic_peak_label = NULL;
     audio_dac_info_label = NULL;
+    audio_loopback_status_label = NULL;
+    audio_loopback_gain_label = NULL;
+    audio_loopback_gain_slider = NULL;
     battery_adc_status_label = NULL;
     battery_adc_detail_label = NULL;
     battery_adc_level_bar = NULL;
@@ -3382,54 +4745,81 @@ static void pop_menu(void)
     }
 }
 
+/**
+ * @brief LVGL event adapter that navigates to the settings page.
+ */
 static void open_settings_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_SETTINGS);
 }
 
+/**
+ * @brief LVGL event adapter that navigates to the display page.
+ */
 static void open_display_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_DISPLAY);
 }
 
+/**
+ * @brief LVGL event adapter that navigates to the audio page.
+ */
 static void open_audio_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_AUDIO);
 }
 
+/**
+ * @brief LVGL event adapter that navigates to the input page.
+ */
 static void open_input_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_INPUT);
 }
 
+/**
+ * @brief LVGL event adapter that navigates to the about page.
+ */
 static void open_about_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_ABOUT);
 }
 
+/**
+ * @brief LVGL event adapter that navigates to the hardware tests page.
+ */
 static void open_hardware_tests_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_HARDWARE_TESTS);
 }
 
+/**
+ * @brief Open the display cb hardware-diagnostic page through the common menu stack.
+ */
 static void open_hw_display_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_HW_DISPLAY);
 }
 
+/**
+ * @brief Open the touch cb hardware-diagnostic page through the common menu stack.
+ */
 static void open_hw_touch_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_HW_TOUCH);
 }
 
+/**
+ * @brief Open the encoder cb hardware-diagnostic page through the common menu stack.
+ */
 static void open_hw_encoder_cb(lv_event_t *e)
 {
     (void)e;
@@ -3437,60 +4827,93 @@ static void open_hw_encoder_cb(lv_event_t *e)
     push_menu(MENU_HW_ENCODER);
 }
 
+/**
+ * @brief Open the backlight cb hardware-diagnostic page through the common menu stack.
+ */
 static void open_hw_backlight_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_HW_BACKLIGHT);
 }
 
+/**
+ * @brief Open the memory cb hardware-diagnostic page through the common menu stack.
+ */
 static void open_hw_memory_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_HW_MEMORY);
 }
 
+/**
+ * @brief Open the common placeholder page for a peripheral that has no integrated test.
+ *
+ * The requested peripheral name is stored globally because the same page builder
+ * is reused for several not-yet-integrated hardware features.
+ */
 static void open_unavailable_hw(const char *name)
 {
     unavailable_hw_name = name;
     push_menu(MENU_HW_UNAVAILABLE);
 }
 
+/**
+ * @brief Open the sd cb hardware-diagnostic page through the common menu stack.
+ */
 static void open_hw_sd_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_HW_SD);
 }
 
+/**
+ * @brief Open the haptics cb hardware-diagnostic page through the common menu stack.
+ */
 static void open_hw_haptics_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_HW_HAPTICS);
 }
 
+/**
+ * @brief Open the audio mic cb hardware-diagnostic page through the common menu stack.
+ */
 static void open_hw_audio_mic_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_HW_AUDIO_MIC);
 }
 
+/**
+ * @brief Open the battery cb hardware-diagnostic page through the common menu stack.
+ */
 static void open_hw_battery_cb(lv_event_t *e)
 {
     (void)e;
     push_menu(MENU_HW_BATTERY);
 }
 
+/**
+ * @brief Open the wireless cb hardware-diagnostic page through the common menu stack.
+ */
 static void open_hw_wireless_cb(lv_event_t *e)
 {
     (void)e;
     open_unavailable_hw("Wi-Fi / Bluetooth / secondary ESP32");
 }
 
+/**
+ * @brief Generic Back-button adapter that returns to the previous menu-stack entry.
+ */
 static void back_cb(lv_event_t *e)
 {
     (void)e;
     pop_menu();
 }
 
+/**
+ * @brief Build the main menu page using the common scrollable container.
+ */
 static void create_main_menu(void)
 {
     menu_cont = create_menu_container();
@@ -3504,6 +4927,9 @@ static void create_main_menu(void)
     create_menu_button(menu_cont, "About", open_about_cb);
 }
 
+/**
+ * @brief Build the media controller menu page using the common scrollable container.
+ */
 static void create_media_controller_menu(void)
 {
     menu_cont = create_menu_container();
@@ -3525,6 +4951,9 @@ static void create_media_controller_menu(void)
     create_menu_button(menu_cont, "Back", back_cb);
 }
 
+/**
+ * @brief Build the settings menu page using the common scrollable container.
+ */
 static void create_settings_menu(void)
 {
     menu_cont = create_menu_container();
@@ -3538,6 +4967,9 @@ static void create_settings_menu(void)
     create_menu_button(menu_cont, "Back", back_cb);
 }
 
+/**
+ * @brief Build the display menu page using the common scrollable container.
+ */
 static void create_display_menu(void)
 {
     menu_cont = create_menu_container();
@@ -3556,6 +4988,9 @@ static void create_display_menu(void)
     create_menu_button(menu_cont, "Back", back_cb);
 }
 
+/**
+ * @brief Build the audio menu page using the common scrollable container.
+ */
 static void create_audio_menu(void)
 {
     menu_cont = create_menu_container();
@@ -3574,12 +5009,21 @@ static void create_audio_menu(void)
     create_menu_button(menu_cont, "Back", back_cb);
 }
 
+/**
+ * @brief Update the encoder's pixels-per-detent scroll sensitivity from the LVGL slider.
+ *
+ * Only the scaling factor changes; the encoder hardware task continues to publish
+ * raw signed steps.
+ */
 static void bezel_sensitivity_changed_cb(lv_event_t *e)
 {
     lv_obj_t *slider = lv_event_get_target_obj(e);
     encoder_scroll_per_step = lv_slider_get_value(slider);
 }
 
+/**
+ * @brief Build the input menu page using the common scrollable container.
+ */
 static void create_input_menu(void)
 {
     menu_cont = create_menu_container();
@@ -3607,6 +5051,9 @@ static void create_input_menu(void)
     create_menu_button(menu_cont, "Back", back_cb);
 }
 
+/**
+ * @brief Build the hardware tests menu page using the common scrollable container.
+ */
 static void create_hardware_tests_menu(void)
 {
     menu_cont = create_menu_container();
@@ -3628,32 +5075,53 @@ static void create_hardware_tests_menu(void)
 
     create_menu_button(menu_cont, "Back", back_cb);
 }
+/**
+ * @brief Play the DRV2605 library effect used for the Strong Click diagnostic.
+ */
 static void haptic_strong_click_cb(lv_event_t *e)
 {
     (void)e;
     ESP_ERROR_CHECK_WITHOUT_ABORT(drv2605_play_effect(1));
 }
+/**
+ * @brief Play the DRV2605 library effect used for the Double Click diagnostic.
+ */
 static void haptic_double_click_cb(lv_event_t *e)
 {
     (void)e;
     ESP_ERROR_CHECK_WITHOUT_ABORT(drv2605_play_effect(10));
 }
+/**
+ * @brief Play the DRV2605 library effect used for the Soft Bump diagnostic.
+ */
 static void haptic_soft_bump_cb(lv_event_t *e)
 {
     (void)e;
     ESP_ERROR_CHECK_WITHOUT_ABORT(drv2605_play_effect(7));
 }
+/**
+ * @brief Play the DRV2605 library effect used for the Buzz diagnostic.
+ */
 static void haptic_buzz_cb(lv_event_t *e)
 {
     (void)e;
     ESP_ERROR_CHECK_WITHOUT_ABORT(drv2605_play_effect(47));
 }
+/**
+ * @brief Stop any active DRV2605 internal-waveform effect.
+ */
 static void haptic_stop_cb(lv_event_t *e)
 {
     (void)e;
     ESP_ERROR_CHECK_WITHOUT_ABORT(drv2605_stop());
 }
 
+/**
+ * @brief Create one labeled color sample for the LCD diagnostic page.
+ *
+ * The helper keeps swatch geometry/label placement identical so color errors can
+ * be compared visually without layout differences muddying the test.
+ */
 static lv_obj_t *create_color_swatch(lv_obj_t *parent, const char *name, uint32_t color)
 {
     lv_obj_t *swatch = lv_obj_create(parent);
@@ -3675,6 +5143,12 @@ static lv_obj_t *create_color_swatch(lv_obj_t *parent, const char *name, uint32_
     return swatch;
 }
 
+/**
+ * @brief Build the display hardware-diagnostic page.
+ *
+ * All widgets are created beneath the current scrollable menu container so the
+ * page is destroyed automatically when show_menu() replaces that container.
+ */
 static void create_hw_display_test_menu(void)
 {
     menu_cont = create_menu_container();
@@ -3698,6 +5172,12 @@ static void create_hw_display_test_menu(void)
     create_menu_button(menu_cont, "Back", back_cb);
 }
 
+/**
+ * @brief Build the touch hardware-diagnostic page.
+ *
+ * All widgets are created beneath the current scrollable menu container so the
+ * page is destroyed automatically when show_menu() replaces that container.
+ */
 static void create_hw_touch_test_menu(void)
 {
     menu_cont = create_menu_container();
@@ -3716,6 +5196,12 @@ static void create_hw_touch_test_menu(void)
     create_menu_button(menu_cont, "Back", back_cb);
 }
 
+/**
+ * @brief Build the encoder hardware-diagnostic page.
+ *
+ * All widgets are created beneath the current scrollable menu container so the
+ * page is destroyed automatically when show_menu() replaces that container.
+ */
 static void create_hw_encoder_test_menu(void)
 {
     menu_cont = create_menu_container();
@@ -3733,6 +5219,9 @@ static void create_hw_encoder_test_menu(void)
     create_menu_button(menu_cont, "Back", back_cb);
 }
 
+/**
+ * @brief Apply the backlight test slider value to the PWM driver immediately.
+ */
 static void backlight_test_changed_cb(lv_event_t *e)
 {
     lv_obj_t *slider = lv_event_get_target_obj(e);
@@ -3747,6 +5236,12 @@ static void backlight_test_changed_cb(lv_event_t *e)
     setUpduty(backlight_test_level);
 }
 
+/**
+ * @brief Build the backlight hardware-diagnostic page.
+ *
+ * All widgets are created beneath the current scrollable menu container so the
+ * page is destroyed automatically when show_menu() replaces that container.
+ */
 static void create_hw_backlight_test_menu(void)
 {
     menu_cont = create_menu_container();
@@ -3763,6 +5258,12 @@ static void create_hw_backlight_test_menu(void)
     create_menu_button(menu_cont, "Back", back_cb);
 }
 
+/**
+ * @brief Build the memory hardware-diagnostic page.
+ *
+ * All widgets are created beneath the current scrollable menu container so the
+ * page is destroyed automatically when show_menu() replaces that container.
+ */
 static void create_hw_memory_test_menu(void)
 {
     menu_cont = create_menu_container();
@@ -3980,13 +5481,21 @@ static void create_hw_sd_test_menu(void)
 /**
  * @brief Build the integrated Audio + MIC hardware-test page.
  *
- * Both sides are now real hardware tests:
+ * This page now has three intentionally distinct audio modes:
  *
- *   - onboard PDM microphone -> live RMS meter
- *   - ESP32-S3 -> CH445P -> PCM5100A -> 3.5 mm 1 kHz tone
+ *   1. MIC Meter
+ *      PDM microphone -> ESP32-S3 RMS/DC diagnostics only.
  *
- * GPIO45 is shared between PDM MIC clock and DAC data, so the firmware never
- * allows the microphone and DAC tone to own the pin at the same time.
+ *   2. Factory Tone
+ *      Synthetic 1 kHz PCM -> verified PCM5100A output path.
+ *
+ *   3. MIC Loopback
+ *      PDM microphone -> I2S0 PDM-to-PCM -> I2S1 -> PCM5100A in real time,
+ *      matching the architecture of Waveshare's official 07_Audio_Test.
+ *
+ * The standalone MIC meter and factory tone can coexist because they use
+ * different I2S controllers. Loopback owns BOTH controllers and therefore
+ * automatically stops the standalone tests before starting.
  */
 static void create_hw_audio_mic_test_menu(void)
 {
@@ -4060,9 +5569,12 @@ static void create_hw_audio_mic_test_menu(void)
     switch (dac_test_state)
     {
     case DAC_TEST_RUNNING:
-        lv_label_set_text(
+        lv_label_set_text_fmt(
             audio_dac_info_label,
-            "PCM5100A: LIVE\n1 kHz test tone");
+            "FACTORY TX: LIVE\n"
+            "CTRL0 1/%d  Blocks %lu",
+            dac_control_readback,
+            (unsigned long)dac_blocks_written);
         break;
 
     case DAC_TEST_ERROR:
@@ -4076,19 +5588,118 @@ static void create_hw_audio_mic_test_menu(void)
         lv_label_set_text(
             audio_dac_info_label,
             "PCM5100A: stopped\n"
-            "Connect headphones / powered speaker");
+            "Factory 44.1k / 16b / MSB");
         break;
     }
 
+    /*
+     * Exact factory-path output test from the supplied Waveshare demo.
+     */
     create_menu_button(
         menu_cont,
-        "Start 1 kHz Tone",
+        "Start Factory 1 kHz Tone",
         audio_dac_start_tone_cb);
 
     create_menu_button(
         menu_cont,
         "Stop Tone",
         audio_dac_stop_tone_cb);
+
+    /*
+     * Real-time loopback status gets its own label because it owns BOTH audio
+     * peripherals and has a more involved startup/shutdown state machine than
+     * either standalone test.
+     */
+    audio_loopback_status_label = lv_label_create(menu_cont);
+    lv_obj_set_width(audio_loopback_status_label, 240);
+    lv_obj_set_style_text_align(
+        audio_loopback_status_label,
+        LV_TEXT_ALIGN_CENTER,
+        0);
+
+    switch (loopback_test_state)
+    {
+    case LOOPBACK_TEST_RUNNING:
+        lv_label_set_text_fmt(
+            audio_loopback_status_label,
+            "LOOPBACK LIVE\n"
+            "Gain %d%%  %s  Blocks %lu",
+            loopback_gain_percent,
+            loopback_muted ? "MUTED" : "PLAY",
+            (unsigned long)loopback_blocks);
+        break;
+
+    case LOOPBACK_TEST_ERROR:
+        lv_label_set_text_fmt(
+            audio_loopback_status_label,
+            "Loopback error\n%s",
+            esp_err_to_name(loopback_last_error));
+        break;
+
+    default:
+        lv_label_set_text(
+            audio_loopback_status_label,
+            "MIC -> DAC Loopback\n"
+            "Headphones first; default gain 50%");
+        break;
+    }
+
+    /*
+     * LIVE LOOPBACK GAIN
+     * ------------------
+     * The slider remains usable whether loopback is stopped or running:
+     *
+     *   - while stopped, it chooses the gain for the next start;
+     *   - while running, the worker picks up the new value on its next block.
+     *
+     * 0..200% deliberately covers attenuation and diagnostic amplification.
+     */
+    audio_loopback_gain_label = lv_label_create(menu_cont);
+    lv_obj_set_width(audio_loopback_gain_label, 240);
+    lv_obj_set_style_text_align(
+        audio_loopback_gain_label,
+        LV_TEXT_ALIGN_CENTER,
+        0);
+    lv_label_set_text_fmt(
+        audio_loopback_gain_label,
+        "Loopback Gain: %d%%",
+        loopback_gain_percent);
+
+    audio_loopback_gain_slider = lv_slider_create(menu_cont);
+    lv_obj_set_size(audio_loopback_gain_slider, 220, 24);
+    lv_slider_set_range(
+        audio_loopback_gain_slider,
+        LOOPBACK_GAIN_MIN_PERCENT,
+        LOOPBACK_GAIN_MAX_PERCENT);
+    lv_slider_set_value(
+        audio_loopback_gain_slider,
+        loopback_gain_percent,
+        LV_ANIM_OFF);
+    lv_obj_add_event_cb(
+        audio_loopback_gain_slider,
+        audio_loopback_gain_changed_cb,
+        LV_EVENT_VALUE_CHANGED,
+        NULL);
+
+    create_menu_button(
+        menu_cont,
+        "Start MIC Loopback",
+        audio_loopback_start_cb);
+
+    /*
+     * Mute does not stop the worker. This is intentionally a separate control
+     * from Stop Loopback so feedback can be silenced immediately while keeping
+     * microphone/DAC clocks and diagnostic counters alive.
+     */
+    create_menu_button(
+        menu_cont,
+        "Mute / Unmute Loopback",
+        audio_loopback_toggle_mute_cb);
+
+    create_menu_button(
+        menu_cont,
+        "Stop Loopback",
+        audio_loopback_stop_cb);
 
     create_menu_button(
         menu_cont,
@@ -4101,6 +5712,12 @@ static void create_hw_audio_mic_test_menu(void)
         audio_mic_back_cb);
 }
 
+/**
+ * @brief Build the haptics hardware-diagnostic page.
+ *
+ * All widgets are created beneath the current scrollable menu container so the
+ * page is destroyed automatically when show_menu() replaces that container.
+ */
 static void create_hw_haptics_test_menu(void)
 {
     menu_cont = create_menu_container();
@@ -4256,7 +5873,9 @@ static void create_hw_battery_test_menu(void)
     battery_adc_worker_start();
 }
 
-
+/**
+ * @brief Build the hw unavailable menu page using the common scrollable container.
+ */
 static void create_hw_unavailable_menu(void)
 {
     menu_cont = create_menu_container();
@@ -4275,6 +5894,9 @@ static void create_hw_unavailable_menu(void)
     create_menu_button(menu_cont, "Back", back_cb);
 }
 
+/**
+ * @brief Build the about menu page using the common scrollable container.
+ */
 static void create_about_menu(void)
 {
     menu_cont = create_menu_container();
@@ -4299,6 +5921,19 @@ static void create_about_menu(void)
  * 10. LVGL DISPLAY AND TOUCH BRIDGE
  * ========================================================================== */
 
+/* --------------------------------------------------------------------------
+ * 10.1 Display flush bridge
+ *
+ * LVGL renders into DMA-capable buffers. esp_lcd transmits those buffers over
+ * QSPI, then calls notify_lvgl_flush_ready() so LVGL knows the buffer can be
+ * reused for another render.
+ * -------------------------------------------------------------------------- */
+/**
+ * @brief esp_lcd completion callback for an LVGL display flush.
+ *
+ * The transfer itself is asynchronous. Calling lv_display_flush_ready() releases
+ * the rendered buffer back to LVGL only after the panel IO reports completion.
+ */
 static bool notify_lvgl_flush_ready(
     esp_lcd_panel_io_handle_t panel_io,
     esp_lcd_panel_io_event_data_t *edata,
@@ -4315,6 +5950,12 @@ static bool notify_lvgl_flush_ready(
     return false;
 }
 
+/**
+ * @brief Send one LVGL invalidated rectangle to the SH8601 panel.
+ *
+ * Before transfer, each RGB565 pixel has its two bytes swapped because LVGL's
+ * in-memory order differs from the byte order required by this QSPI panel path.
+ */
 static void lvgl_flush_cb(
     lv_display_t *disp,
     const lv_area_t *area,
@@ -4352,6 +5993,12 @@ static void lvgl_flush_cb(
         px_map);
 }
 
+/**
+ * @brief Expand invalidated LVGL areas to even pixel boundaries required by the panel path.
+ *
+ * The lower edge is rounded down and the upper edge rounded up, preserving all
+ * requested pixels while satisfying the transfer alignment.
+ */
 static void lvgl_rounder_event_cb(lv_event_t *e)
 {
     lv_area_t *area = lv_event_get_param(e);
@@ -4369,6 +6016,16 @@ static void lvgl_rounder_event_cb(lv_event_t *e)
 }
 
 #if USE_TOUCH
+/* --------------------------------------------------------------------------
+ * 10.2 Touch input bridge
+ * -------------------------------------------------------------------------- */
+/**
+ * @brief Translate board touch coordinates into LVGL pointer input.
+ *
+ * The LCD is rotated 180 degrees in hardware, so X and Y are mirrored before they
+ * are reported to LVGL. On the touch diagnostic page the same coordinates are
+ * also displayed live for calibration/debugging.
+ */
 static void lvgl_touch_cb(
     lv_indev_t *indev,
     lv_indev_data_t *data)
@@ -4417,12 +6074,24 @@ static void lvgl_touch_cb(
 }
 #endif
 
+/* --------------------------------------------------------------------------
+ * 10.3 LVGL timing and task synchronization
+ * -------------------------------------------------------------------------- */
+/**
+ * @brief Periodic esp_timer callback that advances LVGL's millisecond time base.
+ */
 static void increase_lvgl_tick(void *arg)
 {
     /* Tell LVGL how many milliseconds has elapsed */
     lv_tick_inc(LVGL_TICK_PERIOD_MS);
 }
 
+/**
+ * @brief Take the global LVGL mutex.
+ *
+ * A timeout of -1 means wait forever. This wrapper makes the thread-safety rule
+ * explicit anywhere code outside the LVGL task needs protected GUI access.
+ */
 static bool lvgl_lock(int timeout_ms)
 {
     assert(lvgl_mux && "bsp_display_start must be called first");
@@ -4431,12 +6100,21 @@ static bool lvgl_lock(int timeout_ms)
     return xSemaphoreTake(lvgl_mux, timeout_ticks) == pdTRUE;
 }
 
+/**
+ * @brief Release the global LVGL mutex after protected UI work.
+ */
 static void lvgl_unlock(void)
 {
     assert(lvgl_mux && "bsp_display_start must be called first");
     xSemaphoreGive(lvgl_mux);
 }
 
+/**
+ * @brief Run LVGL's timer/event engine continuously in its dedicated FreeRTOS task.
+ *
+ * lv_timer_handler() returns the recommended delay until the next LVGL job. The
+ * result is clamped so the task neither spins too quickly nor sleeps too long.
+ */
 static void lvgl_port_task(void *arg)
 {
     ESP_LOGI(TAG, "Starting LVGL task");
@@ -4467,6 +6145,9 @@ static void lvgl_port_task(void *arg)
  * ========================================================================== */
 
 #ifdef Backlight_Testing
+/**
+ * @brief Optional compile-time backlight sweep used during low-level PWM bring-up.
+ */
 void backlight_test_task(void *arg)
 {
     for (;;)
@@ -4487,6 +6168,15 @@ void backlight_test_task(void *arg)
 }
 #endif
 
+/* --------------------------------------------------------------------------
+ * 11.1 Rotary encoder event worker
+ * -------------------------------------------------------------------------- */
+/**
+ * @brief Wait for BSP encoder direction events and accumulate signed bezel steps.
+ *
+ * This task deliberately does no LVGL work. It converts hardware events into a
+ * small shared counter consumed later by an LVGL timer.
+ */
 static void user_encoder_loop_task(void *arg)
 {
     for (;;)
@@ -4510,6 +6200,15 @@ static void user_encoder_loop_task(void *arg)
     }
 }
 
+/* --------------------------------------------------------------------------
+ * 11.2 LVGL-side encoder consumer
+ * -------------------------------------------------------------------------- */
+/**
+ * @brief Consume accumulated encoder steps from LVGL context.
+ *
+ * Behavior depends on the active page: the encoder diagnostic counts steps, the
+ * media page emits volume HID commands, and ordinary pages scroll vertically.
+ */
 static void encoder_scroll_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -4571,12 +6270,32 @@ static void encoder_scroll_timer_cb(lv_timer_t *timer)
  * 12. APPLICATION ENTRY POINT / HARDWARE INITIALIZATION
  * ========================================================================== */
 
+/* --------------------------------------------------------------------------
+ * 12.1 Boot sequence
+ *
+ * app_main() is intentionally last so all helpers are defined before the
+ * application entry point. Read it as the wiring diagram for the firmware:
+ * initialize physical buses/devices first, create LVGL second, then launch
+ * background input tasks and periodic UI timers.
+ * -------------------------------------------------------------------------- */
+/**
+ * @brief Application entry point executed by ESP-IDF after the RTOS starts.
+ *
+ * Initialization order matters: establish display/panel buses, shared I2C devices,
+ * BLE and LVGL, allocate DMA draw buffers, start the LVGL task and encoder worker,
+ * then create the initial UI and periodic timers.
+ */
 void app_main(void)
 {
 
     ESP_LOGI(TAG, "ENTERED app_main");
 
-    static lv_display_t *disp = NULL; // contains callback functions
+    /*
+     * LVGL's display object. It stores the rendering configuration and callback
+     * hooks, while panel_handle below is the ESP-IDF object that actually talks
+     * to the SH8601 controller.
+     */
+    static lv_display_t *disp = NULL;
 
     ESP_LOGI(TAG, "STEP 1: backlight");
     lcd_bl_pwm_bsp_init(LCD_PWM_MODE_255);
@@ -4598,9 +6317,32 @@ void app_main(void)
     ESP_LOGI(TAG, "STEP 3: panel IO");
     ESP_LOGI(TAG, "Install panel IO");
     esp_lcd_panel_io_handle_t io_handle = NULL;
-    const esp_lcd_panel_io_spi_config_t io_config = SH8601_PANEL_IO_QSPI_CONFIG(PIN_NUM_LCD_CS,
-                                                                                notify_lvgl_flush_ready,
-                                                                                NULL);
+    /*
+     * Do NOT install the LVGL flush-complete callback here.
+     *
+     * SH8601_PANEL_IO_QSPI_CONFIG() stores its callback directly in the SPI
+     * panel-IO object. The previous code supplied notify_lvgl_flush_ready here
+     * with a NULL user context, then registered the same callback a second time
+     * after the LVGL display object was created.
+     *
+     * ESP-IDF correctly warned:
+     *   "Callback on_color_trans_done was already set and now it was overwritten!"
+     *
+     * The callback needs the LVGL display pointer as user_ctx, and that display
+     * does not exist yet at this point in app_main(). Therefore the clean design
+     * is:
+     *
+     *   1. create the panel IO with no color-transfer callback;
+     *   2. create/configure the LVGL display;
+     *   3. register notify_lvgl_flush_ready exactly once with user_ctx = disp.
+     *
+     * The registration in step 3 remains later in app_main().
+     */
+    const esp_lcd_panel_io_spi_config_t io_config =
+        SH8601_PANEL_IO_QSPI_CONFIG(
+            PIN_NUM_LCD_CS,
+            NULL,
+            NULL);
     sh8601_vendor_config_t vendor_config = {
         .init_cmds = lcd_init_cmds,
         .init_cmds_size = sizeof(lcd_init_cmds) / sizeof(lcd_init_cmds[0]),
@@ -4608,7 +6350,11 @@ void app_main(void)
             .use_qspi_interface = 1,
         },
     };
-    // Attach the LCD to the SPI bus
+    /*
+     * Create the QSPI panel-I/O layer. Think of this as the transport object:
+     * it knows which SPI host/chip-select to use, but not the SH8601 register
+     * semantics. esp_lcd_new_panel_sh8601() below adds the panel-specific layer.
+     */
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle));
 
     esp_lcd_panel_handle_t panel_handle = NULL;
@@ -4652,6 +6398,14 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Allocate LVGL draw buffers");
 
+    /*
+     * Partial rendering avoids allocating a full 360x360 framebuffer. Each
+     * DMA-capable buffer stores only LVGL_BUF_HEIGHT rows; while one buffer is
+     * being transferred to the LCD, LVGL can render into the other.
+     *
+     * MALLOC_CAP_DMA is required because the SPI/QSPI DMA engine cannot read
+     * from arbitrary memory regions.
+     */
     const size_t draw_buf_size =
         LCD_H_RES *
         LVGL_BUF_HEIGHT *
@@ -4679,6 +6433,12 @@ void app_main(void)
         disp,
         LV_COLOR_FORMAT_RGB565);
 
+    /*
+     * Double-buffered PARTIAL mode:
+     *   - LVGL renders only invalidated strips/areas.
+     *   - buf1/buf2 alternate between rendering and QSPI transmission.
+     *   - memory use stays much lower than two full-screen framebuffers.
+     */
     lv_display_set_buffers(
         disp,
         buf1,
@@ -4700,6 +6460,22 @@ void app_main(void)
         LV_EVENT_INVALIDATE_AREA,
         NULL);
 
+    /*
+     * Register the LCD DMA-completion callback exactly once, now that `disp`
+     * exists and can safely be passed as user_ctx.
+     *
+     * Flow during every LVGL flush:
+     *
+     *   lvgl_flush_cb()
+     *       -> esp_lcd_panel_draw_bitmap()
+     *       -> SPI/QSPI DMA transfer runs asynchronously
+     *       -> on_color_trans_done interrupt callback
+     *       -> notify_lvgl_flush_ready()
+     *       -> lv_display_flush_ready(disp)
+     *
+     * That final notification tells LVGL that the draw buffer is no longer
+     * being consumed by DMA and can be reused for the next rendered region.
+     */
     const esp_lcd_panel_io_callbacks_t io_callbacks = {
         .on_color_trans_done = notify_lvgl_flush_ready,
     };
@@ -4711,7 +6487,11 @@ void app_main(void)
             disp));
 
     ESP_LOGI(TAG, "Install LVGL tick timer");
-    // Tick interface for LVGL (using esp_timer to generate 2ms periodic event)
+    /*
+     * LVGL needs a monotonically increasing millisecond clock for animations,
+     * input timing, long-press recognition, and its software timers. esp_timer
+     * supplies a precise periodic callback independent of the LVGL task loop.
+     */
     const esp_timer_create_args_t lvgl_tick_timer_args = {
         .callback = &increase_lvgl_tick,
         .name = "lvgl_tick"};
@@ -4738,9 +6518,11 @@ void app_main(void)
         lvgl_touch_cb);
 #endif
 
-    // ----------------------------
-    // Encoder input
-    // ----------------------------
+    /*
+     * Create the mutex BEFORE launching the LVGL task. The LVGL task owns most
+     * GUI execution, while app_main briefly takes the same mutex below to build
+     * the first page and install LVGL timers safely.
+     */
 
     lvgl_mux = xSemaphoreCreateMutex();
     assert(lvgl_mux);
@@ -4759,7 +6541,11 @@ void app_main(void)
         2,
         NULL);
 
-    // draw items here
+    /*
+     * The hardware-facing tasks are now running. Build the initial screen and
+     * install the LVGL-side consumers that translate shared diagnostic/input
+     * state into visible UI updates.
+     */
 
     ESP_LOGI(TAG, "Display UI");
 
@@ -4776,15 +6562,14 @@ void app_main(void)
             5,
             NULL);
 
-    /* Refresh BLE connection text from LVGL context. */
-    lv_timer_create(media_status_timer_cb, 250, NULL);
+        /* Refresh BLE connection text from LVGL context. */
+        lv_timer_create(media_status_timer_cb, 250, NULL);
 
-    /* Refresh live microphone level/status from LVGL context. */
-    lv_timer_create(audio_mic_ui_timer_cb, 100, NULL);
+        /* Refresh live microphone level/status from LVGL context. */
+        lv_timer_create(audio_mic_ui_timer_cb, 100, NULL);
 
-    /* Refresh Battery / ADC values twice per second while that page is open. */
-    lv_timer_create(battery_adc_ui_timer_cb, 500, NULL);
-
+        /* Refresh Battery / ADC values twice per second while that page is open. */
+        lv_timer_create(battery_adc_ui_timer_cb, 500, NULL);
 
         lvgl_unlock();
     }
