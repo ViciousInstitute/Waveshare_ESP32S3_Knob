@@ -4549,13 +4549,7 @@ static void media_update_volume_ui(void)
 {
     if (media_volume_arc != NULL)
     {
-        /*
-         * The top-gap layout uses LV_ARC_MODE_REVERSE so the indicator grows
-         * up the LEFT side, matching the original media-page volume direction.
-         * Reverse mode maps max -> empty and min -> full, so invert only the
-         * visual value here. The user-facing estimate itself remains 0..100.
-         */
-        lv_arc_set_value(media_volume_arc, 100 - media_volume_estimate);
+        lv_arc_set_value(media_volume_arc, media_volume_estimate);
     }
 
     if (media_volume_label != NULL)
@@ -4720,11 +4714,7 @@ static lv_obj_t *create_media_icon_button(
     int32_t glyph_w = lv_obj_get_width(label);
     int32_t glyph_h = lv_obj_get_height(label);
 
-    /*
-     * Keep the center Play glyph at 2.0x. Previous/Next get about 18% more
-     * visual weight in v3 so they do not look undersized beside the center.
-     */
-    lv_obj_set_style_transform_scale(label, transparent ? 604 : 512, 0);
+    lv_obj_set_style_transform_scale(label, 512, 0); /* 2.0x */
     lv_obj_set_style_transform_pivot_x(label, glyph_w / 2, 0);
     lv_obj_set_style_transform_pivot_y(label, glyph_h / 2, 0);
 
@@ -5206,11 +5196,11 @@ static void create_main_menu(void)
  * @brief Build the dedicated circular-layout media controller page.
  *
  * Layout:
- *   - Previous: enlarged left-pointing filled triangle
+ *   - Previous: left-pointing filled triangle
  *   - Play/Pause: centered circular play button
- *   - Next: enlarged right-pointing filled triangle
- *   - Outer 270-degree arc with a clean gap at the top for BLE status
- *   - Mute and Back remain available at the bottom
+ *   - Next: right-pointing filled triangle
+ *   - Outer 270-degree arc: local volume estimate driven by bezel commands
+ *   - Mute and Back remain available in the lower arc gap
  */
 static void create_media_controller_menu(void)
 {
@@ -5225,49 +5215,55 @@ static void create_media_controller_menu(void)
     lv_obj_set_scrollbar_mode(menu_cont, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_style_pad_all(menu_cont, 0, 0);
 
-    /*
-     * The page is self-explanatory from its transport controls, so v3 drops
-     * the redundant "Media" title and gives the BLE connection state the
-     * round display's safest top-center position.
-     */
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, "Media");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 24);
+
     media_status_label = lv_label_create(menu_cont);
     lv_label_set_text(media_status_label, media_controller_status_text());
     lv_obj_set_width(media_status_label, 250);
     lv_obj_set_style_text_align(media_status_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(media_status_label, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_align(media_status_label, LV_ALIGN_TOP_MID, 0, 52);
 
     /*
-     * 270-degree volume dial with a 90-degree gap centered at the TOP.
-     * The indicator runs in reverse so increasing volume fills the LEFT side
-     * first, preserving the visual direction from v1/v2 instead of flipping
-     * to the right side. The rotary bezel remains the volume input.
+     * 270-degree volume dial with a 90-degree gap centered at the bottom. The
+     * arc is presentation-only; the rotary bezel remains the volume input.
      */
+
+     /*
+ * TODO: MEDIA VOLUME ARC ORIENTATION
+ *
+ * The current LVGL arc geometry is visually upside down.
+ * Logical volume tracking is correct.
+ *
+ * Desired:
+ *   - gap centered at top
+ *   - low volume starts at lower-left
+ *   - increasing volume fills in the intended clockwise direction
+ *
+ * Do not alter BLE volume behavior while fixing this.
+ */
     media_volume_arc = lv_arc_create(menu_cont);
-    lv_obj_set_size(media_volume_arc, 300, 300);
-    lv_obj_align(media_volume_arc, LV_ALIGN_CENTER, 0, 5);
+    lv_obj_set_size(media_volume_arc, 304, 304);
+    lv_obj_align(media_volume_arc, LV_ALIGN_CENTER, 0, 4);
     lv_arc_set_range(media_volume_arc, 0, 100);
-    lv_arc_set_rotation(media_volume_arc, 315);
+    lv_arc_set_rotation(media_volume_arc, 135);
     lv_arc_set_bg_angles(media_volume_arc, 0, 270);
-    lv_arc_set_mode(media_volume_arc, LV_ARC_MODE_REVERSE);
-    lv_arc_set_value(media_volume_arc, 100 - media_volume_estimate);
-    lv_obj_set_style_arc_width(media_volume_arc, 5, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(media_volume_arc, 8, LV_PART_INDICATOR);
+    lv_arc_set_value(media_volume_arc, media_volume_estimate);
+    lv_obj_set_style_arc_width(media_volume_arc, 6, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(media_volume_arc, 9, LV_PART_INDICATOR);
     lv_obj_set_style_arc_rounded(media_volume_arc, true, LV_PART_MAIN);
     lv_obj_set_style_arc_rounded(media_volume_arc, true, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(media_volume_arc, LV_OPA_TRANSP, LV_PART_KNOB);
     lv_obj_set_style_border_opa(media_volume_arc, LV_OPA_TRANSP, LV_PART_KNOB);
     lv_obj_remove_flag(media_volume_arc, LV_OBJ_FLAG_CLICKABLE);
 
-    /*
-     * Transport centers are approximately x=100, 180, 260. Previous/Next
-     * have larger touch targets and glyphs than v2, and sit slightly closer
-     * to Play so the three controls read as one intentional cluster.
-     */
+    /* Previous: same filled triangle as Play, rotated to point left. */
     create_media_icon_button(
         menu_cont,
-        58,
-        133,
-        84,
+        44,
+        139,
+        72,
         LV_SYMBOL_PLAY,
         1800,
         true,
@@ -5284,11 +5280,12 @@ static void create_media_controller_menu(void)
         false,
         media_play_pause_cb);
 
+    /* Next: matching right-pointing filled triangle. */
     create_media_icon_button(
         menu_cont,
-        218,
-        133,
-        84,
+        244,
+        139,
+        72,
         LV_SYMBOL_PLAY,
         0,
         true,
@@ -5304,13 +5301,7 @@ static void create_media_controller_menu(void)
     lv_obj_align(mute, LV_ALIGN_BOTTOM_MID, -55, -19);
     lv_obj_t *mute_label = lv_label_create(mute);
     lv_label_set_text(mute_label, LV_SYMBOL_MUTE);
-    lv_obj_update_layout(mute_label);
     lv_obj_center(mute_label);
-    int32_t mute_w = lv_obj_get_width(mute_label);
-    int32_t mute_h = lv_obj_get_height(mute_label);
-    lv_obj_set_style_transform_scale(mute_label, 384, 0); /* 1.5x */
-    lv_obj_set_style_transform_pivot_x(mute_label, mute_w / 2, 0);
-    lv_obj_set_style_transform_pivot_y(mute_label, mute_h / 2, 0);
     lv_obj_add_event_cb(mute, button_press_haptic_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(mute, media_mute_cb, LV_EVENT_PRESSED, NULL);
 
@@ -6776,8 +6767,8 @@ static void secondary_link_ui_timer_cb(lv_timer_t *timer)
         link.last_rx_age_ms < 3000U;
 
     const char *requested_text =
-        link.xsmt_requested == 1 ? "1" :
-        link.xsmt_requested == 0 ? "0" : "?";
+        link.xsmt_requested == 1 ? "1" : link.xsmt_requested == 0 ? "0"
+                                                                  : "?";
 
     const char *mode_text =
         link.companion_mode[0] != '\0' ? link.companion_mode : "?";
