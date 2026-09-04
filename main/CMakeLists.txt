@@ -2,6 +2,7 @@ idf_component_register(
 
     SRCS
         "media_controller_ble.c"
+        "secondary_link.c"
         "main.c"
 
     INCLUDE_DIRS
@@ -27,12 +28,7 @@ idf_component_register(
         sdmmc
         esp_driver_sdmmc
         esp_driver_i2s
+        esp_driver_uart
 
         esp_adc
-)
-
-set_source_files_properties(
-    ${LV_DEMOS_SOURCES}
-    PROPERTIES COMPILE_OPTIONS
-    -DLV_LVGL_H_INCLUDE_SIMPLE
 )

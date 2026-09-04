@@ -70,7 +70,7 @@
  *      PCM5100A BCLK         : GPIO39
  *      PCM5100A WS / LRCK    : GPIO40
  *      PCM5100A DATA         : GPIO41
- *      PCM5100A S3 control   : GPIO0 HIGH
+ *      PCM5100A mux select   : GPIO0 HIGH=S3, LOW=U4WDH
  *
  * This separation is what makes Waveshare's microphone-to-DAC loopback mode
  * possible. Earlier experimental builds incorrectly treated GPIO45 as DAC DATA.
@@ -155,8 +155,9 @@
 #include "lcd_bl_pwm_bsp.h"
 #include "user_encoder_bsp.h"
 
-/* Project-local BLE HID abstraction ------------------------------------- */
+/* Project-local services ------------------------------------------------- */
 #include "media_controller_ble.h"
+#include "secondary_link.h"
 
 /* ============================================================================
  * 1. GLOBAL APPLICATION STATE
@@ -379,6 +380,59 @@ static lv_obj_t *audio_dac_info_label = NULL;
 #define DAC_I2S_DATA_PIN GPIO_NUM_41
 #define DAC_CONTROL_PIN GPIO_NUM_0
 
+/*
+ * CH445P DAC-source selector from the verified board schematic/factory demo:
+ *   GPIO0 HIGH -> ESP32-S3 I2S pins 39/40/41
+ *   GPIO0 LOW  -> ESP32-U4WDH I2S pins 25/27/26
+ *
+ * v24 makes the U4WDH the normal Bluetooth-audio owner. S3 hardware audio
+ * diagnostics temporarily select HIGH and must return the mux LOW on cleanup.
+ */
+static esp_err_t dac_route_select(bool s3_owner)
+{
+    const gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << DAC_CONTROL_PIN,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    esp_err_t err = gpio_config(&cfg);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    const int requested = s3_owner ? 1 : 0;
+    err = gpio_set_level(DAC_CONTROL_PIN, requested);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2));
+
+    const int readback = gpio_get_level(DAC_CONTROL_PIN);
+    if (readback != requested)
+    {
+        ESP_LOGE(
+            TAG,
+            "DAC mux GPIO0 mismatch: requested=%d readback=%d",
+            requested,
+            readback);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "DAC mux owner -> %s (GPIO0=%d)",
+        s3_owner ? "ESP32-S3" : "ESP32-U4WDH",
+        readback);
+
+    return ESP_OK;
+}
+
 #define DAC_SAMPLE_RATE_HZ 44100
 #define DAC_TONE_HZ 1000
 #define DAC_TONE_TASK_STACK 4096
@@ -534,9 +588,28 @@ static lv_obj_t *audio_loopback_gain_slider = NULL;
 
 /*
  * Media-controller page state. Bluetooth callbacks never update LVGL directly;
- * an LVGL timer polls BLE state and refreshes this label safely.
+ * an LVGL timer polls BLE state and refreshes the status label safely.
+ *
+ * Consumer-Control volume is one-way: Windows does not report its absolute
+ * mixer value back through the BLE HID link. The arc therefore shows a local
+ * estimate that follows successful bezel Volume Up/Down commands. It starts at
+ * 50% after boot and can drift if Windows volume is changed elsewhere.
  */
 static lv_obj_t *media_status_label = NULL;
+static lv_obj_t *media_volume_arc = NULL;
+static lv_obj_t *media_volume_label = NULL;
+static int32_t media_volume_estimate = 50;
+#define MEDIA_VOLUME_ESTIMATE_STEP 2
+
+/*
+ * Secondary-ESP diagnostic page state.
+ *
+ * UART traffic lives entirely in secondary_link.c. These pointers are LVGL
+ * presentation objects only. A periodic LVGL timer copies a thread-safe link
+ * snapshot and renders it while staying in the UI task.
+ */
+static lv_obj_t *secondary_link_status_label = NULL;
+static lv_obj_t *secondary_link_last_line_label = NULL;
 
 /* ============================================================================
  * 2. DISPLAY CONFIGURATION
@@ -765,6 +838,7 @@ typedef enum
     MENU_HW_HAPTICS,
     MENU_HW_AUDIO_MIC,
     MENU_HW_BATTERY,
+    MENU_HW_SECONDARY,
     MENU_HW_UNAVAILABLE
 } menu_id_t;
 
@@ -787,6 +861,15 @@ static int menu_stack_top = -1;
  * -------------------------------------------------------------------------- */
 static lv_obj_t *create_menu_container(void);
 static lv_obj_t *create_menu_button(lv_obj_t *parent, const char *text, lv_event_cb_t callback);
+static lv_obj_t *create_media_icon_button(
+    lv_obj_t *parent,
+    int32_t x,
+    int32_t y,
+    int32_t size,
+    const char *symbol,
+    int32_t rotation_tenths,
+    bool transparent,
+    lv_event_cb_t callback);
 
 /* --------------------------------------------------------------------------
  * 9.2 Navigation router and history
@@ -820,6 +903,7 @@ static void create_hw_sd_test_menu(void);
 static void create_hw_haptics_test_menu(void);
 static void create_hw_audio_mic_test_menu(void);
 static void create_hw_battery_test_menu(void);
+static void create_hw_secondary_test_menu(void);
 static void create_hw_unavailable_menu(void);
 
 static void open_media_controller_cb(lv_event_t *e);
@@ -828,6 +912,7 @@ static void media_play_pause_cb(lv_event_t *e);
 static void media_next_cb(lv_event_t *e);
 static void media_mute_cb(lv_event_t *e);
 static void media_status_timer_cb(lv_timer_t *timer);
+static void media_update_volume_ui(void);
 
 /* --------------------------------------------------------------------------
  * 9.3 Navigation callbacks
@@ -853,6 +938,14 @@ static void open_hw_haptics_cb(lv_event_t *e);
 static void open_hw_audio_mic_cb(lv_event_t *e);
 static void open_hw_battery_cb(lv_event_t *e);
 static void open_hw_wireless_cb(lv_event_t *e);
+
+/* Secondary ESP32 / inter-processor UART diagnostic callbacks */
+static void secondary_link_ping_cb(lv_event_t *e);
+static void secondary_link_status_request_cb(lv_event_t *e);
+static void secondary_link_caps_request_cb(lv_event_t *e);
+static void secondary_link_xsmt_unmute_cb(lv_event_t *e);
+static void secondary_link_xsmt_mute_cb(lv_event_t *e);
+static void secondary_link_ui_timer_cb(lv_timer_t *timer);
 
 static void back_cb(lv_event_t *e);
 static void bezel_sensitivity_changed_cb(lv_event_t *e);
@@ -2369,24 +2462,10 @@ static void dac_tone_task(void *arg)
     dac_control_readback = -1;
 
     /*
-     * FACTORY STEP 1: hand PCM5100A control to the ESP32-S3.
-     *
-     * The official Waveshare audio_bsp.c configures GPIO0 as an output and
-     * immediately drives it HIGH. Its source comment translates to:
-     *
-     *      "give PCM5100A control to ESP32S3"
-     *
-     * We use INPUT_OUTPUT so the UI can also verify the physical pad level.
+     * FACTORY STEP 1: temporarily hand PCM5100A routing to the ESP32-S3.
+     * v24 returns this mux to the U4WDH in cleanup so Bluetooth audio resumes.
      */
-    gpio_config_t control_cfg = {
-        .pin_bit_mask = 1ULL << DAC_CONTROL_PIN,
-        .mode = GPIO_MODE_INPUT_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-
-    esp_err_t err = gpio_config(&control_cfg);
+    esp_err_t err = dac_route_select(true);
 
     if (err != ESP_OK)
     {
@@ -2395,16 +2474,6 @@ static void dac_tone_task(void *arg)
         goto cleanup;
     }
 
-    err = gpio_set_level(DAC_CONTROL_PIN, 1);
-
-    if (err != ESP_OK)
-    {
-        dac_last_error = err;
-        dac_test_state = DAC_TEST_ERROR;
-        goto cleanup;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(2));
     dac_control_readback = gpio_get_level(DAC_CONTROL_PIN);
 
     /*
@@ -2614,9 +2683,15 @@ cleanup:
     }
 
     /*
-     * Leave GPIO0 HIGH after the test, matching Waveshare's demo. Their audio
-     * initialization asserts the control handoff once and leaves it asserted.
+     * v24 default owner is the U4WDH Bluetooth renderer. Return GPIO0 LOW even
+     * after a failed S3 diagnostic so the normal audio path cannot be stranded.
      */
+    esp_err_t route_err = dac_route_select(false);
+    if (route_err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Unable to return DAC mux to U4WDH: %s", esp_err_to_name(route_err));
+    }
+
     if (dac_test_state != DAC_TEST_ERROR)
     {
         dac_test_state = DAC_TEST_STOPPED;
@@ -2815,21 +2890,10 @@ static void audio_loopback_task(void *arg)
     /*
      * FACTORY CONTROL HANDOFF
      * -----------------------
-     * Waveshare drives GPIO0 HIGH before initializing audio. Their source
-     * comment explicitly identifies this as giving PCM5100A control to the
-     * ESP32-S3.
-     *
-     * INPUT_OUTPUT lets us verify the physical pad level after driving it.
+     * Temporarily select the S3 side of the CH445P while this local diagnostic
+     * owns I2S1. Cleanup always returns the mux to the U4WDH Bluetooth path.
      */
-    gpio_config_t control_cfg = {
-        .pin_bit_mask = 1ULL << DAC_CONTROL_PIN,
-        .mode = GPIO_MODE_INPUT_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-
-    esp_err_t err = gpio_config(&control_cfg);
+    esp_err_t err = dac_route_select(true);
 
     if (err != ESP_OK)
     {
@@ -2838,16 +2902,6 @@ static void audio_loopback_task(void *arg)
         goto cleanup;
     }
 
-    err = gpio_set_level(DAC_CONTROL_PIN, 1);
-
-    if (err != ESP_OK)
-    {
-        loopback_last_error = err;
-        loopback_test_state = LOOPBACK_TEST_ERROR;
-        goto cleanup;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(2));
     loopback_control_readback = gpio_get_level(DAC_CONTROL_PIN);
 
     /*
@@ -3356,10 +3410,15 @@ cleanup:
     }
 
     /*
-     * GPIO0 remains HIGH after shutdown, just like Waveshare's audio demo.
-     * Keeping the verified control handoff asserted avoids needless toggling of
-     * the PCM5100A path between diagnostics.
+     * Return the CH445P to the U4WDH after the local loopback releases I2S.
+     * This makes Bluetooth audio the stable default route in v24.
      */
+    esp_err_t route_err = dac_route_select(false);
+    if (route_err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Unable to return DAC mux to U4WDH: %s", esp_err_to_name(route_err));
+    }
+
     if (loopback_test_state != LOOPBACK_TEST_ERROR)
     {
         loopback_test_state = LOOPBACK_TEST_STOPPED;
@@ -4479,6 +4538,35 @@ static void media_status_timer_cb(lv_timer_t *timer)
     lv_label_set_text(media_status_label, media_controller_status_text());
 }
 
+/**
+ * @brief Refresh the media-page volume arc from the local HID volume estimate.
+ *
+ * BLE Consumer Control provides Volume Up/Down commands but no absolute-volume
+ * feedback from Windows. The tilde in the label intentionally communicates
+ * that this is an estimate rather than a synchronized host mixer value.
+ */
+static void media_update_volume_ui(void)
+{
+    if (media_volume_arc != NULL)
+    {
+        /*
+         * The top-gap layout uses LV_ARC_MODE_REVERSE so the indicator grows
+         * up the LEFT side, matching the original media-page volume direction.
+         * Reverse mode maps max -> empty and min -> full, so invert only the
+         * visual value here. The user-facing estimate itself remains 0..100.
+         */
+        lv_arc_set_value(media_volume_arc, 100 - media_volume_estimate);
+    }
+
+    if (media_volume_label != NULL)
+    {
+        lv_label_set_text_fmt(
+            media_volume_label,
+            "VOL ~%ld%%",
+            (long)media_volume_estimate);
+    }
+}
+
 /* ============================================================================
  * 9. MENU / UI IMPLEMENTATION
  * ========================================================================== */
@@ -4583,6 +4671,85 @@ static lv_obj_t *create_menu_button(
 }
 
 /**
+ * @brief Create an absolute-positioned media-control icon button.
+ *
+ * Previous/Next use the same filled PLAY glyph. Rotating the Previous glyph by
+ * 180 degrees gives matching left/right triangles without depending on an
+ * additional Unicode font. A transparent button leaves only the triangle
+ * visible while retaining a generous touch target.
+ */
+static lv_obj_t *create_media_icon_button(
+    lv_obj_t *parent,
+    int32_t x,
+    int32_t y,
+    int32_t size,
+    const char *symbol,
+    int32_t rotation_tenths,
+    bool transparent,
+    lv_event_cb_t callback)
+{
+    lv_obj_t *button = lv_button_create(parent);
+    lv_obj_set_pos(button, x, y);
+    lv_obj_set_size(button, size, size);
+    lv_obj_set_style_radius(button, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_all(button, 0, 0);
+
+    if (transparent)
+    {
+        /*
+         * Previous/Next are intentionally icon-only controls. Their touch area
+         * remains a generous circle, but the button chrome is hidden.
+         */
+        lv_obj_set_style_bg_opa(button, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(button, 0, 0);
+        lv_obj_set_style_shadow_width(button, 0, 0);
+    }
+
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, symbol);
+
+    /*
+     * Keep the label content-sized before scaling. v1 forced a 48x48 label,
+     * which left the glyph at the top of that box and made the transformed
+     * icon appear clipped/off-center. A content-sized label keeps the actual
+     * triangle centered in the touch target.
+     */
+    lv_obj_update_layout(label);
+    lv_obj_center(label);
+
+    int32_t glyph_w = lv_obj_get_width(label);
+    int32_t glyph_h = lv_obj_get_height(label);
+
+    /*
+     * Keep the center Play glyph at 2.0x. Previous/Next get about 18% more
+     * visual weight in v3 so they do not look undersized beside the center.
+     */
+    lv_obj_set_style_transform_scale(label, transparent ? 604 : 512, 0);
+    lv_obj_set_style_transform_pivot_x(label, glyph_w / 2, 0);
+    lv_obj_set_style_transform_pivot_y(label, glyph_h / 2, 0);
+
+    if (transparent)
+    {
+        /* White icon text disappeared against the white page in v1. */
+        lv_obj_set_style_text_color(label, lv_color_hex(0x2196F3), 0);
+    }
+
+    if (rotation_tenths != 0)
+    {
+        lv_obj_set_style_transform_rotation(label, rotation_tenths, 0);
+    }
+
+    lv_obj_add_event_cb(button, button_press_haptic_cb, LV_EVENT_PRESSED, NULL);
+
+    if (callback != NULL)
+    {
+        lv_obj_add_event_cb(button, callback, LV_EVENT_PRESSED, NULL);
+    }
+
+    return button;
+}
+
+/**
  * @brief Provide immediate generic haptic feedback for normal UI buttons.
  *
  * This callback is attached to LV_EVENT_PRESSED, so the vibration begins when
@@ -4633,6 +4800,10 @@ static void show_menu(menu_id_t menu)
     encoder_test_label = NULL;
     sd_test_label = NULL;
     media_status_label = NULL;
+    media_volume_arc = NULL;
+    media_volume_label = NULL;
+    secondary_link_status_label = NULL;
+    secondary_link_last_line_label = NULL;
     audio_mic_status_label = NULL;
     audio_mic_level_bar = NULL;
     audio_mic_peak_label = NULL;
@@ -4705,6 +4876,9 @@ static void show_menu(menu_id_t menu)
         break;
     case MENU_HW_BATTERY:
         create_hw_battery_test_menu();
+        break;
+    case MENU_HW_SECONDARY:
+        create_hw_secondary_test_menu();
         break;
     case MENU_HW_UNAVAILABLE:
         create_hw_unavailable_menu();
@@ -4846,18 +5020,6 @@ static void open_hw_memory_cb(lv_event_t *e)
 }
 
 /**
- * @brief Open the common placeholder page for a peripheral that has no integrated test.
- *
- * The requested peripheral name is stored globally because the same page builder
- * is reused for several not-yet-integrated hardware features.
- */
-static void open_unavailable_hw(const char *name)
-{
-    unavailable_hw_name = name;
-    push_menu(MENU_HW_UNAVAILABLE);
-}
-
-/**
  * @brief Open the sd cb hardware-diagnostic page through the common menu stack.
  */
 static void open_hw_sd_cb(lv_event_t *e)
@@ -4899,7 +5061,120 @@ static void open_hw_battery_cb(lv_event_t *e)
 static void open_hw_wireless_cb(lv_event_t *e)
 {
     (void)e;
-    open_unavailable_hw("Wi-Fi / Bluetooth / secondary ESP32");
+
+    /*
+     * v22 retains the proven link/XSMT diagnostic and adds protocol discovery plus
+     * state-changing companion control: PCM5100A XSMT mute/unmute. The menu
+     * name is retained conceptually because the secondary
+     * MCU will eventually own more wireless/audio companion responsibilities.
+     */
+    push_menu(MENU_HW_SECONDARY);
+}
+
+/**
+ * @brief Force an immediate PING on the inter-ESP link.
+ *
+ * A heartbeat already runs once per second in secondary_link.c. This button is
+ * useful while watching the serial monitor or a logic-analyzer decode because
+ * it creates an on-demand transaction without changing any hardware state.
+ */
+static void secondary_link_ping_cb(lv_event_t *e)
+{
+    (void)e;
+
+    esp_err_t err = secondary_link_send_ping();
+
+    if (err != ESP_OK && secondary_link_status_label != NULL)
+    {
+        lv_label_set_text_fmt(
+            secondary_link_status_label,
+            "PING failed\n%s",
+            esp_err_to_name(err));
+    }
+}
+
+/**
+ * @brief Request the canonical v22 STATE frame from companion firmware v5.
+ */
+static void secondary_link_status_request_cb(lv_event_t *e)
+{
+    (void)e;
+
+    esp_err_t err = secondary_link_request_status();
+
+    if (err != ESP_OK && secondary_link_status_label != NULL)
+    {
+        lv_label_set_text_fmt(
+            secondary_link_status_label,
+            "STATE request failed\n%s",
+            esp_err_to_name(err));
+    }
+}
+
+/**
+ * @brief Request the companion's protocol and capability advertisement.
+ *
+ * This is deliberately separate from the liveness PING and state query. A
+ * future S3 build can therefore discover whether an attached companion really
+ * supports Classic Bluetooth/A2DP before exposing those controls to the user.
+ */
+static void secondary_link_caps_request_cb(lv_event_t *e)
+{
+    (void)e;
+
+    esp_err_t err = secondary_link_request_capabilities();
+
+    if (err != ESP_OK && secondary_link_status_label != NULL)
+    {
+        lv_label_set_text_fmt(
+            secondary_link_status_label,
+            "CAPS request failed\n%s",
+            esp_err_to_name(err));
+    }
+}
+
+/**
+ * @brief Ask companion v5 to drive PCM5100A XSMT HIGH.
+ *
+ * XSMT HIGH is the already-proven normal audio state. The S3 does not assume
+ * success from the UART write; secondary_link.c waits for the companion's ACK
+ * and physical GPIO32 readback before changing the displayed XSMT state.
+ */
+static void secondary_link_xsmt_unmute_cb(lv_event_t *e)
+{
+    (void)e;
+
+    esp_err_t err = secondary_link_set_xsmt(true);
+
+    if (err != ESP_OK && secondary_link_status_label != NULL)
+    {
+        lv_label_set_text_fmt(
+            secondary_link_status_label,
+            "XSMT=1 request failed\n%s",
+            esp_err_to_name(err));
+    }
+}
+
+/**
+ * @brief Ask companion v5 to drive PCM5100A XSMT LOW.
+ *
+ * This mutes the PCM5100A output pin-side only. It deliberately does
+ * not stop, delete, or reconfigure the S3 I2S TX channel, so the known-good
+ * audio pipeline remains intact while we test remote hardware control.
+ */
+static void secondary_link_xsmt_mute_cb(lv_event_t *e)
+{
+    (void)e;
+
+    esp_err_t err = secondary_link_set_xsmt(false);
+
+    if (err != ESP_OK && secondary_link_status_label != NULL)
+    {
+        lv_label_set_text_fmt(
+            secondary_link_status_label,
+            "XSMT=0 request failed\n%s",
+            esp_err_to_name(err));
+    }
 }
 
 /**
@@ -4928,27 +5203,127 @@ static void create_main_menu(void)
 }
 
 /**
- * @brief Build the media controller menu page using the common scrollable container.
+ * @brief Build the dedicated circular-layout media controller page.
+ *
+ * Layout:
+ *   - Previous: enlarged left-pointing filled triangle
+ *   - Play/Pause: centered circular play button
+ *   - Next: enlarged right-pointing filled triangle
+ *   - Outer 270-degree arc with a clean gap at the top for BLE status
+ *   - Mute and Back remain available at the bottom
  */
 static void create_media_controller_menu(void)
 {
-    menu_cont = create_menu_container();
+    /*
+     * This page deliberately does not use create_menu_container(). Its controls
+     * are spatial rather than a vertically scrolling list.
+     */
+    menu_cont = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(menu_cont, LCD_H_RES, LCD_V_RES);
+    lv_obj_center(menu_cont);
+    lv_obj_remove_flag(menu_cont, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(menu_cont, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_pad_all(menu_cont, 0, 0);
 
-    lv_obj_t *title = lv_label_create(menu_cont);
-    lv_label_set_text(title, "PC Media Controller");
-
+    /*
+     * The page is self-explanatory from its transport controls, so v3 drops
+     * the redundant "Media" title and gives the BLE connection state the
+     * round display's safest top-center position.
+     */
     media_status_label = lv_label_create(menu_cont);
     lv_label_set_text(media_status_label, media_controller_status_text());
+    lv_obj_set_width(media_status_label, 250);
+    lv_obj_set_style_text_align(media_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(media_status_label, LV_ALIGN_TOP_MID, 0, 34);
 
-    lv_obj_t *hint = lv_label_create(menu_cont);
-    lv_label_set_text(hint, "Bezel: Volume\nPair in Windows Bluetooth");
-    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    /*
+     * 270-degree volume dial with a 90-degree gap centered at the TOP.
+     * The indicator runs in reverse so increasing volume fills the LEFT side
+     * first, preserving the visual direction from v1/v2 instead of flipping
+     * to the right side. The rotary bezel remains the volume input.
+     */
+    media_volume_arc = lv_arc_create(menu_cont);
+    lv_obj_set_size(media_volume_arc, 300, 300);
+    lv_obj_align(media_volume_arc, LV_ALIGN_CENTER, 0, 5);
+    lv_arc_set_range(media_volume_arc, 0, 100);
+    lv_arc_set_rotation(media_volume_arc, 315);
+    lv_arc_set_bg_angles(media_volume_arc, 0, 270);
+    lv_arc_set_mode(media_volume_arc, LV_ARC_MODE_REVERSE);
+    lv_arc_set_value(media_volume_arc, 100 - media_volume_estimate);
+    lv_obj_set_style_arc_width(media_volume_arc, 5, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(media_volume_arc, 8, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(media_volume_arc, true, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(media_volume_arc, true, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(media_volume_arc, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_obj_set_style_border_opa(media_volume_arc, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_obj_remove_flag(media_volume_arc, LV_OBJ_FLAG_CLICKABLE);
 
-    create_menu_button(menu_cont, "Previous", media_previous_cb);
-    create_menu_button(menu_cont, "Play / Pause", media_play_pause_cb);
-    create_menu_button(menu_cont, "Next", media_next_cb);
-    create_menu_button(menu_cont, "Mute", media_mute_cb);
-    create_menu_button(menu_cont, "Back", back_cb);
+    /*
+     * Transport centers are approximately x=100, 180, 260. Previous/Next
+     * have larger touch targets and glyphs than v2, and sit slightly closer
+     * to Play so the three controls read as one intentional cluster.
+     */
+    create_media_icon_button(
+        menu_cont,
+        58,
+        133,
+        84,
+        LV_SYMBOL_PLAY,
+        1800,
+        true,
+        media_previous_cb);
+
+    /* Center button retains Play/Pause HID behavior while using a play glyph. */
+    create_media_icon_button(
+        menu_cont,
+        140,
+        135,
+        80,
+        LV_SYMBOL_PLAY,
+        0,
+        false,
+        media_play_pause_cb);
+
+    create_media_icon_button(
+        menu_cont,
+        218,
+        133,
+        84,
+        LV_SYMBOL_PLAY,
+        0,
+        true,
+        media_next_cb);
+
+    media_volume_label = lv_label_create(menu_cont);
+    lv_obj_set_width(media_volume_label, 120);
+    lv_obj_set_style_text_align(media_volume_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(media_volume_label, LV_ALIGN_BOTTOM_MID, 0, -66);
+
+    lv_obj_t *mute = lv_button_create(menu_cont);
+    lv_obj_set_size(mute, 78, 38);
+    lv_obj_align(mute, LV_ALIGN_BOTTOM_MID, -55, -19);
+    lv_obj_t *mute_label = lv_label_create(mute);
+    lv_label_set_text(mute_label, LV_SYMBOL_MUTE);
+    lv_obj_update_layout(mute_label);
+    lv_obj_center(mute_label);
+    int32_t mute_w = lv_obj_get_width(mute_label);
+    int32_t mute_h = lv_obj_get_height(mute_label);
+    lv_obj_set_style_transform_scale(mute_label, 384, 0); /* 1.5x */
+    lv_obj_set_style_transform_pivot_x(mute_label, mute_w / 2, 0);
+    lv_obj_set_style_transform_pivot_y(mute_label, mute_h / 2, 0);
+    lv_obj_add_event_cb(mute, button_press_haptic_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(mute, media_mute_cb, LV_EVENT_PRESSED, NULL);
+
+    lv_obj_t *back = lv_button_create(menu_cont);
+    lv_obj_set_size(back, 78, 38);
+    lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 55, -19);
+    lv_obj_t *back_label = lv_label_create(back);
+    lv_label_set_text(back_label, "Back");
+    lv_obj_center(back_label);
+    lv_obj_add_event_cb(back, button_press_haptic_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(back, back_cb, LV_EVENT_PRESSED, NULL);
+
+    media_update_volume_ui();
 }
 
 /**
@@ -5071,10 +5446,90 @@ static void create_hardware_tests_menu(void)
     create_menu_button(menu_cont, "Haptic Motor", open_hw_haptics_cb);
     create_menu_button(menu_cont, "Audio + MIC", open_hw_audio_mic_cb);
     create_menu_button(menu_cont, "Battery / ADC", open_hw_battery_cb);
-    create_menu_button(menu_cont, "Wireless / ESP32", open_hw_wireless_cb);
+    create_menu_button(menu_cont, "Secondary ESP32 / UART", open_hw_wireless_cb);
 
     create_menu_button(menu_cont, "Back", back_cb);
 }
+
+/**
+ * @brief Build the live ESP32-S3 <-> ESP32-U4WDH UART diagnostic page.
+ *
+ * secondary_link.c owns all byte-stream work. This page only displays copied
+ * state and issues explicit high-level requests, preserving the project's rule
+ * that background hardware tasks never manipulate LVGL objects directly.
+ */
+static void create_hw_secondary_test_menu(void)
+{
+    menu_cont = create_menu_container();
+
+    lv_obj_t *title = lv_label_create(menu_cont);
+    lv_label_set_text(title, "Secondary ESP32 Link");
+
+    /*
+     * Keep the verified probe points visible on the device itself. If we ever
+     * need a scope/logic analyzer, the expected wiring is one screen away.
+     */
+    lv_obj_t *wiring = lv_label_create(menu_cont);
+    lv_label_set_text(
+        wiring,
+        "UART2  115200 8-N-1\n"
+        "S3 TX38 -> U4 RX18\n"
+        "S3 RX48 <- U4 TX23\n"
+        "DAC mux GPIO0=0 -> U4");
+    lv_obj_set_width(wiring, 250);
+    lv_obj_set_style_text_align(wiring, LV_TEXT_ALIGN_CENTER, 0);
+
+    /*
+     * v24 exposes the companion as the A2DP sink + PCM5100A renderer. Keep
+     * the advertised name on the diagnostic page so pairing can be done
+     * without consulting a README.
+     * v24 also shows PCM5100A render/output/drop telemetry from companion v7.
+     */
+    lv_obj_t *bt_audio_name = lv_label_create(menu_cont);
+    lv_label_set_text(bt_audio_name, "BT Audio: Waveshare Knob Audio");
+    lv_obj_set_width(bt_audio_name, 265);
+    lv_obj_set_style_text_align(bt_audio_name, LV_TEXT_ALIGN_CENTER, 0);
+
+    secondary_link_status_label = lv_label_create(menu_cont);
+    lv_obj_set_width(secondary_link_status_label, 265);
+    lv_obj_set_style_text_align(
+        secondary_link_status_label,
+        LV_TEXT_ALIGN_CENTER,
+        0);
+    lv_label_set_text(secondary_link_status_label, "Link status: waiting...");
+
+    secondary_link_last_line_label = lv_label_create(menu_cont);
+    lv_obj_set_width(secondary_link_last_line_label, 265);
+    lv_obj_set_style_text_align(
+        secondary_link_last_line_label,
+        LV_TEXT_ALIGN_CENTER,
+        0);
+    lv_label_set_long_mode(
+        secondary_link_last_line_label,
+        LV_LABEL_LONG_WRAP);
+    lv_label_set_text(secondary_link_last_line_label, "Last RX: (none)");
+
+    create_menu_button(menu_cont, "Ping Now", secondary_link_ping_cb);
+    create_menu_button(menu_cont, "Request State", secondary_link_status_request_cb);
+    create_menu_button(menu_cont, "Request Capabilities", secondary_link_caps_request_cb);
+
+    /*
+     * These are intentionally explicit diagnostic controls rather than a
+     * toggle. The label tells us exactly which electrical level should result,
+     * which is much easier to validate against logs or a scope.
+     */
+    create_menu_button(
+        menu_cont,
+        "Audio Unmute (XSMT=1)",
+        secondary_link_xsmt_unmute_cb);
+    create_menu_button(
+        menu_cont,
+        "Audio Mute (XSMT=0)",
+        secondary_link_xsmt_mute_cb);
+
+    create_menu_button(menu_cont, "Back", back_cb);
+}
+
 /**
  * @brief Play the DRV2605 library effect used for the Strong Click diagnostic.
  */
@@ -6253,6 +6708,24 @@ static void encoder_scroll_timer_cb(lv_timer_t *timer)
         {
             if (media_controller_send(command) == ESP_OK)
             {
+                /*
+                 * Consumer Control is one-way, so this is intentionally a local
+                 * estimate. Only move the arc when the HID command was accepted.
+                 */
+                if (command == MEDIA_CONTROL_VOLUME_UP)
+                {
+                    media_volume_estimate += MEDIA_VOLUME_ESTIMATE_STEP;
+                    if (media_volume_estimate > 100)
+                        media_volume_estimate = 100;
+                }
+                else
+                {
+                    media_volume_estimate -= MEDIA_VOLUME_ESTIMATE_STEP;
+                    if (media_volume_estimate < 0)
+                        media_volume_estimate = 0;
+                }
+
+                media_update_volume_ui();
                 ESP_ERROR_CHECK_WITHOUT_ABORT(drv2605_play_effect(1));
             }
         }
@@ -6266,6 +6739,158 @@ static void encoder_scroll_timer_cb(lv_timer_t *timer)
         -steps * encoder_scroll_per_step,
         LV_ANIM_OFF);
 }
+/**
+ * @brief Refresh the Secondary ESP32 diagnostic page from LVGL context.
+ *
+ * The UART worker never receives LVGL pointers. It publishes a protected status
+ * structure, this timer copies that structure, and only then are labels updated.
+ */
+static void secondary_link_ui_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    if (current_menu != MENU_HW_SECONDARY ||
+        secondary_link_status_label == NULL)
+    {
+        return;
+    }
+
+    secondary_link_status_t link;
+    secondary_link_get_status(&link);
+
+    if (!link.initialized)
+    {
+        lv_label_set_text(
+            secondary_link_status_label,
+            "UART2 not initialized");
+        return;
+    }
+
+    /*
+     * ONLINE remains based on fresh protocol traffic, not a sticky flag. This
+     * catches a companion reset or unplug within roughly three heartbeat cycles.
+     */
+    const bool online =
+        link.companion_seen &&
+        link.last_rx_age_ms != UINT32_MAX &&
+        link.last_rx_age_ms < 3000U;
+
+    const char *requested_text =
+        link.xsmt_requested == 1 ? "1" :
+        link.xsmt_requested == 0 ? "0" : "?";
+
+    const char *mode_text =
+        link.companion_mode[0] != '\0' ? link.companion_mode : "?";
+    const char *bt_text =
+        link.bt_state[0] != '\0' ? link.bt_state : "?";
+    const char *a2dp_text =
+        link.a2dp_state[0] != '\0' ? link.a2dp_state : "?";
+    const char *stream_text =
+        link.stream_state[0] != '\0' ? link.stream_state : "?";
+    const char *peer_text =
+        link.peer_bda[0] != '\0' ? link.peer_bda : "-";
+
+    /*
+     * v24 distinguishes PCM received from A2DP from PCM actually rendered by
+     * the U4WDH I2S worker. DROP should remain zero during healthy playback.
+     */
+    const unsigned long long pcm_kib =
+        (unsigned long long)(link.a2dp_pcm_bytes / 1024ULL);
+    const unsigned long long out_kib =
+        (unsigned long long)(link.audio_output_bytes / 1024ULL);
+    const unsigned long long drop_kib =
+        (unsigned long long)(link.audio_drop_bytes / 1024ULL);
+
+    if (link.xsmt_level >= 0)
+    {
+        lv_label_set_text_fmt(
+            secondary_link_status_label,
+            "%s FW%lu P%lu  %s\n"
+            "XSMT=%d Req=%s Cmd/Ack %lu/%lu\n"
+            "Caps %08lX BT %d/%d/%d DAC%d\n"
+            "BT %s A2DP %s\n"
+            "Stream %s PCM %lluKiB\n"
+            "DAC %luHz/%uch Out %lluKiB\n"
+            "Drop %lluKiB AErr %lu\n"
+            "Peer %s\n"
+            "Ping/Pong %lu/%lu RTT %lums\n"
+            "Age %lums Uptime %lums\n"
+            "Lines TX/RX %lu/%lu Err %lu BErr %lu",
+            online ? "ONLINE" : "STALE",
+            (unsigned long)link.companion_fw,
+            (unsigned long)link.protocol_version,
+            mode_text,
+            link.xsmt_level,
+            requested_text,
+            (unsigned long)link.xsmt_commands_sent,
+            (unsigned long)link.xsmt_acks_received,
+            (unsigned long)link.capabilities,
+            link.cap_bt_classic ? 1 : 0,
+            link.cap_a2dp_sink ? 1 : 0,
+            link.cap_avrcp ? 1 : 0,
+            link.cap_dac_audio ? 1 : 0,
+            bt_text,
+            a2dp_text,
+            stream_text,
+            pcm_kib,
+            (unsigned long)link.audio_sample_rate_hz,
+            (unsigned)link.audio_channels,
+            out_kib,
+            drop_kib,
+            (unsigned long)link.audio_errors,
+            peer_text,
+            (unsigned long)link.pings_sent,
+            (unsigned long)link.pongs_received,
+            (unsigned long)link.last_rtt_ms,
+            (unsigned long)link.last_rx_age_ms,
+            (unsigned long)link.companion_uptime_ms,
+            (unsigned long)link.tx_lines,
+            (unsigned long)link.rx_lines,
+            (unsigned long)link.parse_errors,
+            (unsigned long)link.bt_errors);
+    }
+    else
+    {
+        lv_label_set_text_fmt(
+            secondary_link_status_label,
+            "%s FW%lu P%lu %s\n"
+            "XSMT=? Req=%s\n"
+            "Caps %08lX BT %d/%d/%d DAC%d\n"
+            "BT %s A2DP %s %s\n"
+            "PCM %lluKiB Out %lluKiB\n"
+            "Rate %luHz Drop %lluKiB\n"
+            "Peer %s Ping/Pong %lu/%lu",
+            link.companion_seen ? "STALE" : "WAITING",
+            (unsigned long)link.companion_fw,
+            (unsigned long)link.protocol_version,
+            mode_text,
+            requested_text,
+            (unsigned long)link.capabilities,
+            link.cap_bt_classic ? 1 : 0,
+            link.cap_a2dp_sink ? 1 : 0,
+            link.cap_avrcp ? 1 : 0,
+            link.cap_dac_audio ? 1 : 0,
+            bt_text,
+            a2dp_text,
+            stream_text,
+            pcm_kib,
+            out_kib,
+            (unsigned long)link.audio_sample_rate_hz,
+            drop_kib,
+            peer_text,
+            (unsigned long)link.pings_sent,
+            (unsigned long)link.pongs_received);
+    }
+
+    if (secondary_link_last_line_label != NULL)
+    {
+        lv_label_set_text_fmt(
+            secondary_link_last_line_label,
+            "Last RX:\n%s",
+            link.last_line[0] != '\0' ? link.last_line : "(none)");
+    }
+}
+
 /* ============================================================================
  * 12. APPLICATION ENTRY POINT / HARDWARE INITIALIZATION
  * ========================================================================== */
@@ -6299,6 +6924,16 @@ void app_main(void)
 
     ESP_LOGI(TAG, "STEP 1: backlight");
     lcd_bl_pwm_bsp_init(LCD_PWM_MODE_255);
+
+    /*
+     * v24 normal audio ownership: select the ESP32-U4WDH I2S inputs on CH445P.
+     * Local S3 DAC diagnostics override this only for their own lifetime.
+     */
+    esp_err_t dac_mux_err = dac_route_select(false);
+    if (dac_mux_err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "DAC mux U4WDH handoff failed: %s", esp_err_to_name(dac_mux_err));
+    }
 
     ESP_LOGI(TAG, "Initialize SPI bus");
     const spi_bus_config_t buscfg =
@@ -6390,6 +7025,24 @@ void app_main(void)
     if (media_init_err != ESP_OK)
     {
         ESP_LOGW(TAG, "BLE media controller unavailable: %s", esp_err_to_name(media_init_err));
+    }
+
+    /*
+     * Bring up the board-internal UART link without making it a boot dependency.
+     * If the companion is still on v2 or is temporarily being reflashed, the S3
+     * display/audio/BLE application continues normally and simply reports that
+     * the secondary link is waiting.
+     */
+    ESP_LOGI(TAG, "Initialize secondary ESP32 UART link");
+
+    esp_err_t secondary_link_err = secondary_link_init();
+
+    if (secondary_link_err != ESP_OK)
+    {
+        ESP_LOGW(
+            TAG,
+            "Secondary ESP32 link unavailable: %s",
+            esp_err_to_name(secondary_link_err));
     }
 
     ESP_LOGI(TAG, "Initialize LVGL library");
@@ -6570,6 +7223,9 @@ void app_main(void)
 
         /* Refresh Battery / ADC values twice per second while that page is open. */
         lv_timer_create(battery_adc_ui_timer_cb, 500, NULL);
+
+        /* Render a copied inter-ESP UART snapshot from LVGL context. */
+        lv_timer_create(secondary_link_ui_timer_cb, 250, NULL);
 
         lvgl_unlock();
     }
